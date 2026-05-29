@@ -1,6 +1,8 @@
 # MedIR
 
-VSM-based information retrieval system for medical literature, built on the TREC Clinical Decision Support track dataset.
+MedIR is a full information retrieval system for clinical medical literature. It builds an inverted index over a collection of PubMed Central articles, ranks documents using Vector Space Model (VSM) with tf·idf cosine similarity, and evaluates retrieval quality with standard IR metrics.
+
+Built on the TREC Clinical Decision Support track dataset, it supports three query types (diagnosis, test, treatment) and includes a desktop GUI for interactive search alongside a batch evaluation pipeline that outputs MAP, NDCG, P@K, R@K, and R-Precision scores.
 
 ---
 
