@@ -7,6 +7,7 @@ import mitos.stemmer.Stemmer;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.stream.Collectors;
 public class IRQualityEvaluator {
 
     interface IQueryEngine {
@@ -14,10 +15,15 @@ public class IRQualityEvaluator {
     }
 
     static class RealQueryEngine implements IQueryEngine {
+        private final String model;
+        RealQueryEngine(String model) { this.model = model; }
+
         @Override
         public List<QueryEvaluator.Result> search(List<String> stems, String topicType, int topK) throws Exception {
             int fetchK = topK * 20;
-            List<QueryEvaluator.Result> raw = QueryEvaluator.searchVSM(stems, fetchK);
+            List<QueryEvaluator.Result> raw = "bm25".equalsIgnoreCase(model)
+                ? QueryEvaluator.searchBM25(stems, fetchK)
+                : QueryEvaluator.searchVSM(stems, fetchK);
             return QueryEvaluator.filterByType(raw, topicType, topK);
         }
     }
@@ -62,6 +68,7 @@ public class IRQualityEvaluator {
         String docDir     = base + File.separator + "doc";
         int    topK       = 10;
         String useField   = "summary";
+        String model      = "both";
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -71,6 +78,7 @@ public class IRQualityEvaluator {
                 case "--topk":    topK       = Integer.parseInt(args[++i]); break;
                 case "--output":  docDir     = args[++i]; break;
                 case "--field":   useField   = args[++i]; break;
+                case "--model":   model      = args[++i]; break;
             }
         }
 
@@ -105,39 +113,50 @@ public class IRQualityEvaluator {
         }
         System.out.println("Evaluating " + evalTopics.size() + " topics\n");
 
-        CachingQueryEngineProxy engine = new CachingQueryEngineProxy(new RealQueryEngine());
+        List<String> modelsToRun = "both".equalsIgnoreCase(model)
+            ? Arrays.asList("vsm", "bm25")
+            : Collections.singletonList(model.toLowerCase());
 
-        List<TopicMetrics> allMetrics   = new ArrayList<>();
-        StringBuilder      trecResults  = new StringBuilder();
+        Map<String, List<TopicMetrics>> allModelMetrics = new LinkedHashMap<>();
+        StringBuilder trecResults = new StringBuilder();
 
-        for (Topic topic : evalTopics) {
-            int    id   = topic.getNumber();
-            String type = String.valueOf(topic.getType());
-            String text = "description".equals(useField) ? topic.getDescription() : topic.getSummary();
+        for (String m : modelsToRun) {
+            CachingQueryEngineProxy engine = new CachingQueryEngineProxy(new RealQueryEngine(m));
+            List<TopicMetrics> allMetrics  = new ArrayList<>();
 
-            List<String>                stems   = QueryEvaluator.processQuery(text);
-            List<QueryEvaluator.Result> results = engine.search(stems, type, topK);
-            Map<String, Integer>        tQrels  = qrels.get(id);
+            if (modelsToRun.size() > 1) System.out.println("--- " + m.toUpperCase() + " ---");
 
-            // TREC results format
-            for (int r = 0; r < results.size(); r++) {
-                trecResults.append(id).append(" Q0 ")
-                        .append(results.get(r).pmcid).append(" ")
-                        .append(r + 1).append(" ")
-                        .append(String.format("%.6f", results.get(r).score))
-                        .append(" VSM\n");
+            for (Topic topic : evalTopics) {
+                int    id   = topic.getNumber();
+                String type = String.valueOf(topic.getType());
+                String text = "description".equals(useField) ? topic.getDescription() : topic.getSummary();
+
+                List<String>                stems   = QueryEvaluator.processQuery(text);
+                List<QueryEvaluator.Result> results = engine.search(stems, type, topK);
+                Map<String, Integer>        tQrels  = qrels.get(id);
+
+                for (int r = 0; r < results.size(); r++) {
+                    trecResults.append(id).append(" Q0 ")
+                            .append(results.get(r).pmcid).append(" ")
+                            .append(r + 1).append(" ")
+                            .append(String.format("%.6f", results.get(r).score))
+                            .append(" ").append(m.toUpperCase()).append("\n");
+                }
+
+                TopicMetrics tm = computeMetrics(id, type, results, tQrels, topK);
+                allMetrics.add(tm);
+                printTopicLine(tm);
             }
 
-            TopicMetrics m = computeMetrics(id, type, results, tQrels, topK);
-            allMetrics.add(m);
-            printTopicLine(m);
+            System.out.printf("%nProxy cache: %d hits / %d misses%n%n", engine.hits, engine.misses);
+            allModelMetrics.put(m, allMetrics);
         }
 
-        System.out.printf("%nProxy cache: %d hits / %d misses%n", engine.hits, engine.misses);
+        if (modelsToRun.size() > 1) printComparison(allModelMetrics);
 
         writeFile(resultsOut, trecResults.toString());
-        writeEvalTSV(evalOut, allMetrics);
-        System.out.println("\nresults.txt      -> " + resultsOut);
+        writeEvalTSV(evalOut, allModelMetrics.values().iterator().next());
+        System.out.println("results.txt      -> " + resultsOut);
         System.out.println("qrels.txt        -> " + qrelsOut);
         System.out.println("eval_results.txt -> " + evalOut);
     }
@@ -291,6 +310,25 @@ public class IRQualityEvaluator {
                         sap/n, sn5/n, sn10/n, srp/n);
             }
         }
+    }
+
+    static void printComparison(Map<String, List<TopicMetrics>> modelMetrics) {
+        System.out.println("\n==========================================");
+        System.out.println("  Model Comparison");
+        System.out.println("==========================================");
+        System.out.printf("  %-10s  %8s  %8s  %8s  %8s%n", "Model", "MAP", "P@10", "NDCG@10", "R-Prec");
+        System.out.println("  ----------------------------------------");
+        for (Map.Entry<String, List<TopicMetrics>> e : modelMetrics.entrySet()) {
+            List<TopicMetrics> metrics = e.getValue();
+            int n = metrics.size();
+            double map = metrics.stream().mapToDouble(m -> m.ap).sum() / n;
+            double p10 = metrics.stream().mapToDouble(m -> m.p10).sum() / n;
+            double ndcg = metrics.stream().mapToDouble(m -> m.ndcg10).sum() / n;
+            double rp  = metrics.stream().mapToDouble(m -> m.rPrec).sum() / n;
+            System.out.printf("  %-10s  %8.4f  %8.4f  %8.4f  %8.4f%n",
+                e.getKey().toUpperCase(), map, p10, ndcg, rp);
+        }
+        System.out.println("==========================================\n");
     }
 
     static void writeQrelsTrec(String path, Map<Integer, Map<String, Integer>> qrels) throws IOException {

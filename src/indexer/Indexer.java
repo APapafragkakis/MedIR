@@ -19,6 +19,7 @@ public class Indexer {
     static Map<String, Integer> docNumericID = new LinkedHashMap<>();
     static Map<String, Long> docFileOffsets = new HashMap<>();
     static int posCounter = 0;
+    static final Map<String, Integer> docLengths = new HashMap<>();
 
     static String BASE_DIR = ".";
 
@@ -154,6 +155,7 @@ public class Indexer {
         for (String cat : xml.getCategories()) {
             processTag(docID, "category", cat);
         }
+        docLengths.put(docID, posCounter);
     }
 
     static void createDocumentsFile() throws IOException {
@@ -197,7 +199,7 @@ public class Indexer {
 
         for (String docID : docPaths.keySet()) {
             docFileOffsets.put(docID, raf.getFilePointer());
-            String line = docNumericID.get(docID) + " | " + docPaths.get(docID) + " | " + docNorms.get(docID) + "\n";
+            String line = docNumericID.get(docID) + " | " + docPaths.get(docID) + " | " + docNorms.get(docID) + " | " + docLengths.getOrDefault(docID, 0) + "\n";
             raf.writeBytes(line);
         }
 

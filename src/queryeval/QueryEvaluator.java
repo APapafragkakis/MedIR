@@ -23,7 +23,13 @@ public class QueryEvaluator {
     static final Map<String, VocabEntry>   vocabulary  = new HashMap<>();
     static final Map<String, List<String>> stemToWords = new HashMap<>();
     static final Set<String>               stopwords   = new HashSet<>();
-    static int totalDocs = 0;
+    static int    totalDocs = 0;
+    static double avgDocLen = 0;
+    static final Map<Integer, Integer> docLengths = new HashMap<>();
+    static String MODEL = "bm25";
+
+    static final double BM25_K1 = 1.5;
+    static final double BM25_B  = 0.75;
 
     static class VocabEntry {
         final String stem;
@@ -87,6 +93,7 @@ public class QueryEvaluator {
                 case "--topk":    TOP_K        = Integer.parseInt(args[++i]); break;
                 case "--snippet": SHOW_SNIPPET = true;                        break;
                 case "--type":    TYPE_FILTER  = args[++i];                   break;
+                case "--model":   MODEL        = args[++i];                   break;
             }
         }
 
@@ -134,10 +141,21 @@ public class QueryEvaluator {
     }
 
     static void countDocuments() throws IOException {
-        try (RandomAccessFile raf = new RandomAccessFile(
-                INDEX_DIR + File.separator + "DocumentsFile.txt", "r")) {
-            while (raf.readLine() != null) totalDocs++;
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(
+                new FileInputStream(INDEX_DIR + File.separator + "DocumentsFile.txt"), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                totalDocs++;
+                String[] p = line.split(" \\| ");
+                if (p.length >= 4) {
+                    int docNum = Integer.parseInt(p[0].trim());
+                    int len    = Integer.parseInt(p[3].trim());
+                    docLengths.put(docNum, len);
+                    avgDocLen += len;
+                }
+            }
         }
+        if (totalDocs > 0) avgDocLen /= totalDocs;
     }
 
     static List<String> processQuery(String text) {
@@ -265,6 +283,82 @@ public class QueryEvaluator {
         }
     }
 
+    static List<Result> searchBM25(List<String> queryStems, int topK) throws IOException {
+        if (queryStems.isEmpty()) return Collections.emptyList();
+
+        Map<String, Integer> queryTF  = new LinkedHashMap<>();
+        for (String s : queryStems) queryTF.merge(s, 1, Integer::sum);
+
+        Map<Integer, Double> scores    = new HashMap<>();
+        Map<Integer, Long>   docOffset = new HashMap<>();
+
+        try (RandomAccessFile postRaf = new RandomAccessFile(
+                     INDEX_DIR + File.separator + "PostingFile.txt",  "r");
+             RandomAccessFile docsRaf = new RandomAccessFile(
+                     INDEX_DIR + File.separator + "DocumentsFile.txt", "r")) {
+
+            for (Map.Entry<String, Integer> qe : queryTF.entrySet()) {
+                String queryStem = qe.getKey();
+
+                List<String> words = stemToWords.getOrDefault(queryStem, Collections.emptyList());
+                if (words.isEmpty()) {
+                    List<String> suggestions = suggestOOV(queryStem);
+                    if (!suggestions.isEmpty()) {
+                        List<String> merged = new ArrayList<>();
+                        for (String s : suggestions) merged.addAll(stemToWords.getOrDefault(s, Collections.emptyList()));
+                        words = merged;
+                    }
+                }
+
+                for (String word : words) {
+                    VocabEntry entry = vocabulary.get(word);
+                    if (entry == null || entry.df == 0) continue;
+
+                    double idf = Math.log((totalDocs - entry.df + 0.5) / (entry.df + 0.5) + 1.0);
+
+                    postRaf.seek(entry.pointer);
+                    for (int i = 0; i < entry.df; i++) {
+                        String postLine = postRaf.readLine();
+                        if (postLine == null) break;
+                        String[] p = postLine.split(" \\| ");
+                        if (p.length < 4) continue;
+                        int  docNum = Integer.parseInt(p[0].trim());
+                        int  tf     = Integer.parseInt(p[1].trim());
+                        long dOff   = Long.parseLong(p[3].trim());
+
+                        double dl     = docLengths.getOrDefault(docNum, (int) Math.max(1, avgDocLen));
+                        double tfNorm = tf * (BM25_K1 + 1) / (tf + BM25_K1 * (1 - BM25_B + BM25_B * dl / Math.max(1, avgDocLen)));
+                        scores.merge(docNum, idf * tfNorm, Double::sum);
+                        docOffset.putIfAbsent(docNum, dOff);
+                    }
+                }
+            }
+
+            List<Result> results = new ArrayList<>();
+            for (Map.Entry<Integer, Double> se : scores.entrySet()) {
+                Long off = docOffset.get(se.getKey());
+                if (off == null) continue;
+                docsRaf.seek(off);
+                String docLine = docsRaf.readLine();
+                if (docLine == null) continue;
+                String[] dp = docLine.split(" \\| ");
+                if (dp.length < 2) continue;
+                String path  = dp[1].trim();
+                String pmcid = new File(path).getName().replace(".nxml", "");
+                results.add(new Result(path, pmcid, se.getValue()));
+            }
+
+            results.sort(null);
+            return results.subList(0, Math.min(topK, results.size()));
+        }
+    }
+
+    static List<Result> search(List<String> queryStems, int topK) throws IOException {
+        return "bm25".equalsIgnoreCase(MODEL)
+            ? searchBM25(queryStems, topK)
+            : searchVSM(queryStems, topK);
+    }
+
     static String getSnippet(String docPath, List<String> queryStems) {
         try {
             NXMLFileReader reader = new NXMLFileReader(new File(docPath));
@@ -294,9 +388,9 @@ public class QueryEvaluator {
     static void interactiveMode() throws Exception {
         BufferedReader br = new BufferedReader(
                 new InputStreamReader(System.in, StandardCharsets.UTF_8));
-        String sep = "─".repeat(56);
+        String sep = "-".repeat(56);
 
-        System.out.println("\nMedIR  —  'exit' to quit, prefix ':' for snippet\n");
+        System.out.println("\nMedIR  [" + MODEL.toUpperCase() + "]  —  'exit' to quit, prefix ':' for snippet\n");
 
         while (true) {
             System.out.print("> ");
@@ -317,7 +411,7 @@ public class QueryEvaluator {
             }
 
             int          fetchK  = (TYPE_FILTER != null && !"all".equalsIgnoreCase(TYPE_FILTER)) ? TOP_K * 20 : TOP_K;
-            List<Result> raw     = searchVSM(stems, fetchK);
+            List<Result> raw     = search(stems, fetchK);
             List<Result> results = filterByType(raw, TYPE_FILTER, TOP_K);
             long elapsed = System.currentTimeMillis() - t0;
 
@@ -367,7 +461,7 @@ public class QueryEvaluator {
 
             List<String> stems  = processQuery(text);
             int          fetchK = (type != null && !"all".equalsIgnoreCase(type)) ? TOP_K * 20 : TOP_K;
-            List<Result> raw    = searchVSM(stems, fetchK);
+            List<Result> raw    = search(stems, fetchK);
             List<Result> results = filterByType(raw, type, TOP_K);
 
             for (int i = 0; i < results.size(); i++) {
