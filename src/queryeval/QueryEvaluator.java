@@ -10,6 +10,8 @@ import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
+import java.util.regex.*;
+import java.util.stream.*;
 
 public class QueryEvaluator {
 
@@ -31,6 +33,14 @@ public class QueryEvaluator {
     static final double BM25_K1 = 1.5;
     static final double BM25_B  = 0.75;
 
+    // Rocchio pseudo-relevance feedback parameters
+    static final int ROCCHIO_FEEDBACK_DOCS  = 3;
+    static final int ROCCHIO_EXPAND_TERMS   = 5;
+
+    // -------------------------------------------------------------------------
+    // Inner classes
+    // -------------------------------------------------------------------------
+
     static class VocabEntry {
         final String stem;
         final int    df;
@@ -47,27 +57,31 @@ public class QueryEvaluator {
         Result(String path, String pmcid, double score) {
             this.path = path; this.pmcid = pmcid; this.score = score;
         }
-        @Override
-        public int compareTo(Result o) { return Double.compare(o.score, this.score); }
+        @Override public int compareTo(Result o) { return Double.compare(o.score, this.score); }
     }
+
+    // Holds positional postings for one stem+doc
+    static class DocPositions {
+        final long          docOffset;
+        final List<Integer> positions;
+        DocPositions(long offset, List<Integer> positions) {
+            this.docOffset = offset; this.positions = positions;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Bootstrap
+    // -------------------------------------------------------------------------
 
     static String resolveBaseDir() {
         Path cwd = Paths.get("").toAbsolutePath();
-        if (Files.exists(cwd.resolve("Stopwords").resolve("stopwordsEn.txt"))) {
-            return cwd.toString();
-        }
+        if (Files.exists(cwd.resolve("Stopwords").resolve("stopwordsEn.txt"))) return cwd.toString();
         try {
             Path src = Paths.get(
                 QueryEvaluator.class.getProtectionDomain().getCodeSource().getLocation().toURI()
             ).toAbsolutePath();
             for (Path p = src; p != null; p = p.getParent()) {
-                if (Files.exists(p.resolve("Stopwords").resolve("stopwordsEn.txt"))) {
-                    return p.toString();
-                }
-                Path candidate = p.resolve("Retrival_Information_project-main").resolve("Phase_A");
-                if (Files.exists(candidate.resolve("Stopwords").resolve("stopwordsEn.txt"))) {
-                    return candidate.toString();
-                }
+                if (Files.exists(p.resolve("Stopwords").resolve("stopwordsEn.txt"))) return p.toString();
             }
         } catch (URISyntaxException ignored) {}
         return cwd.toString();
@@ -104,12 +118,13 @@ public class QueryEvaluator {
 
         System.out.println("Index loaded: " + vocabulary.size() + " terms | " + totalDocs + " documents");
 
-        if ("topics".equals(mode)) {
-            processTopics(topicsFile, useField);
-        } else {
-            interactiveMode();
-        }
+        if ("topics".equals(mode)) processTopics(topicsFile, useField);
+        else                       interactiveMode();
     }
+
+    // -------------------------------------------------------------------------
+    // Index loading
+    // -------------------------------------------------------------------------
 
     static void loadStopwords(String path) throws IOException {
         File f = new File(path);
@@ -117,8 +132,7 @@ public class QueryEvaluator {
         try (BufferedReader br = new BufferedReader(
                 new InputStreamReader(new FileInputStream(f), StandardCharsets.UTF_8))) {
             String line;
-            while ((line = br.readLine()) != null)
-                stopwords.add(line.trim().toLowerCase());
+            while ((line = br.readLine()) != null) stopwords.add(line.trim().toLowerCase());
         }
     }
 
@@ -158,6 +172,11 @@ public class QueryEvaluator {
         if (totalDocs > 0) avgDocLen /= totalDocs;
     }
 
+    // -------------------------------------------------------------------------
+    // Query processing
+    // -------------------------------------------------------------------------
+
+    // Stem a plain text string into a list of stems (no phrase detection)
     static List<String> processQuery(String text) {
         String[] tokens = text.toLowerCase()
                               .replaceAll("[^\\p{L}\\p{Nd} ]+", " ")
@@ -170,6 +189,25 @@ public class QueryEvaluator {
         }
         return result;
     }
+
+    // Parse quoted phrases out of raw query text.
+    // Returns the bag-of-words stems from the non-quoted portion;
+    // populated 'phrases' list receives each phrase as a stem sequence.
+    static List<String> extractPhrases(String text, List<List<String>> phrases) {
+        Matcher m = Pattern.compile("\"([^\"]+)\"").matcher(text);
+        StringBuffer sb = new StringBuffer();
+        while (m.find()) {
+            List<String> phraseStems = processQuery(m.group(1));
+            if (phraseStems.size() > 1) phrases.add(phraseStems);
+            m.appendReplacement(sb, " ");
+        }
+        m.appendTail(sb);
+        return processQuery(sb.toString());
+    }
+
+    // -------------------------------------------------------------------------
+    // Spelling / OOV
+    // -------------------------------------------------------------------------
 
     static int editDistance(String a, String b) {
         int la = a.length(), lb = b.length();
@@ -192,9 +230,7 @@ public class QueryEvaluator {
         for (String vocabStem : stemToWords.keySet()) {
             if (!vocabStem.startsWith(prefix)) continue;
             int d = editDistance(stem, vocabStem);
-            if (d <= 2) {
-                ranked.computeIfAbsent(d, k -> new ArrayList<>()).add(vocabStem);
-            }
+            if (d <= 2) ranked.computeIfAbsent(d, k -> new ArrayList<>()).add(vocabStem);
         }
         for (List<String> bucket : ranked.values()) {
             for (String s : bucket) {
@@ -204,6 +240,22 @@ public class QueryEvaluator {
         }
         return suggestions;
     }
+
+    // Returns OOV stems -> nearest suggestions (for "did you mean?" display)
+    static Map<String, List<String>> getOovInfo(List<String> stems) {
+        Map<String, List<String>> oov = new LinkedHashMap<>();
+        for (String stem : stems) {
+            if (!stemToWords.containsKey(stem)) {
+                List<String> s = suggestOOV(stem);
+                if (!s.isEmpty()) oov.put(stem, s);
+            }
+        }
+        return oov;
+    }
+
+    // -------------------------------------------------------------------------
+    // VSM search
+    // -------------------------------------------------------------------------
 
     static List<Result> searchVSM(List<String> queryStems, int topK) throws IOException {
         if (queryStems.isEmpty()) return Collections.emptyList();
@@ -224,36 +276,29 @@ public class QueryEvaluator {
                 int    qtf       = qe.getValue();
 
                 List<String> words = stemToWords.getOrDefault(queryStem, Collections.emptyList());
-
                 if (words.isEmpty()) {
-                    List<String> suggestions = suggestOOV(queryStem);
-                    if (!suggestions.isEmpty()) {
-                        System.out.println("  [OOV] '" + queryStem + "' not in index -> trying " + suggestions);
+                    List<String> sug = suggestOOV(queryStem);
+                    if (!sug.isEmpty()) {
                         List<String> merged = new ArrayList<>();
-                        for (String s : suggestions) merged.addAll(stemToWords.getOrDefault(s, Collections.emptyList()));
+                        for (String s : sug) merged.addAll(stemToWords.getOrDefault(s, Collections.emptyList()));
                         words = merged;
-                    } else {
-                        System.out.println("  [OOV] '" + queryStem + "' not in index, no suggestion found.");
                     }
                 }
 
                 for (String word : words) {
                     VocabEntry entry = vocabulary.get(word);
                     if (entry == null || entry.df == 0) continue;
-
                     double idf     = Math.log((double) totalDocs / entry.df);
                     double qWeight = qtf * idf;
-
                     postRaf.seek(entry.pointer);
                     for (int i = 0; i < entry.df; i++) {
                         String postLine = postRaf.readLine();
                         if (postLine == null) break;
                         String[] p = postLine.split(" \\| ");
                         if (p.length < 4) continue;
-                        int    docNum = Integer.parseInt(p[0].trim());
-                        int    tf     = Integer.parseInt(p[1].trim());
-                        long   dOff   = Long.parseLong(p[3].trim());
-
+                        int  docNum = Integer.parseInt(p[0].trim());
+                        int  tf     = Integer.parseInt(p[1].trim());
+                        long dOff   = Long.parseLong(p[3].trim());
                         scores.merge(docNum, qWeight * (tf * idf), Double::sum);
                         docOffset.putIfAbsent(docNum, dOff);
                     }
@@ -264,7 +309,6 @@ public class QueryEvaluator {
             for (Map.Entry<Integer, Double> se : scores.entrySet()) {
                 Long off = docOffset.get(se.getKey());
                 if (off == null) continue;
-
                 docsRaf.seek(off);
                 String docLine = docsRaf.readLine();
                 if (docLine == null) continue;
@@ -273,20 +317,22 @@ public class QueryEvaluator {
                 String path  = dp[1].trim();
                 double norm  = Double.parseDouble(dp[2].trim());
                 String pmcid = new File(path).getName().replace(".nxml", "");
-
                 double finalScore = norm > 0 ? se.getValue() / norm : 0;
                 results.add(new Result(path, pmcid, finalScore));
             }
-
             results.sort(null);
             return results.subList(0, Math.min(topK, results.size()));
         }
     }
 
+    // -------------------------------------------------------------------------
+    // BM25 search
+    // -------------------------------------------------------------------------
+
     static List<Result> searchBM25(List<String> queryStems, int topK) throws IOException {
         if (queryStems.isEmpty()) return Collections.emptyList();
 
-        Map<String, Integer> queryTF  = new LinkedHashMap<>();
+        Map<String, Integer> queryTF = new LinkedHashMap<>();
         for (String s : queryStems) queryTF.merge(s, 1, Integer::sum);
 
         Map<Integer, Double> scores    = new HashMap<>();
@@ -302,10 +348,10 @@ public class QueryEvaluator {
 
                 List<String> words = stemToWords.getOrDefault(queryStem, Collections.emptyList());
                 if (words.isEmpty()) {
-                    List<String> suggestions = suggestOOV(queryStem);
-                    if (!suggestions.isEmpty()) {
+                    List<String> sug = suggestOOV(queryStem);
+                    if (!sug.isEmpty()) {
                         List<String> merged = new ArrayList<>();
-                        for (String s : suggestions) merged.addAll(stemToWords.getOrDefault(s, Collections.emptyList()));
+                        for (String s : sug) merged.addAll(stemToWords.getOrDefault(s, Collections.emptyList()));
                         words = merged;
                     }
                 }
@@ -313,9 +359,7 @@ public class QueryEvaluator {
                 for (String word : words) {
                     VocabEntry entry = vocabulary.get(word);
                     if (entry == null || entry.df == 0) continue;
-
                     double idf = Math.log((totalDocs - entry.df + 0.5) / (entry.df + 0.5) + 1.0);
-
                     postRaf.seek(entry.pointer);
                     for (int i = 0; i < entry.df; i++) {
                         String postLine = postRaf.readLine();
@@ -325,7 +369,6 @@ public class QueryEvaluator {
                         int  docNum = Integer.parseInt(p[0].trim());
                         int  tf     = Integer.parseInt(p[1].trim());
                         long dOff   = Long.parseLong(p[3].trim());
-
                         double dl     = docLengths.getOrDefault(docNum, (int) Math.max(1, avgDocLen));
                         double tfNorm = tf * (BM25_K1 + 1) / (tf + BM25_K1 * (1 - BM25_B + BM25_B * dl / Math.max(1, avgDocLen)));
                         scores.merge(docNum, idf * tfNorm, Double::sum);
@@ -347,31 +390,165 @@ public class QueryEvaluator {
                 String pmcid = new File(path).getName().replace(".nxml", "");
                 results.add(new Result(path, pmcid, se.getValue()));
             }
-
             results.sort(null);
             return results.subList(0, Math.min(topK, results.size()));
         }
     }
 
+    // Dispatcher
     static List<Result> search(List<String> queryStems, int topK) throws IOException {
         return "bm25".equalsIgnoreCase(MODEL)
             ? searchBM25(queryStems, topK)
             : searchVSM(queryStems, topK);
     }
 
+    // -------------------------------------------------------------------------
+    // Phrase search (positional index)
+    // -------------------------------------------------------------------------
+
+    // Loads complete positional postings for all words that stem to 'stem'
+    static Map<Integer, DocPositions> loadStemPostings(String stem) throws IOException {
+        Map<Integer, DocPositions> result = new HashMap<>();
+        List<String> words = stemToWords.getOrDefault(stem, Collections.emptyList());
+        if (words.isEmpty()) return result;
+        try (RandomAccessFile raf = new RandomAccessFile(
+                INDEX_DIR + File.separator + "PostingFile.txt", "r")) {
+            for (String word : words) {
+                VocabEntry entry = vocabulary.get(word);
+                if (entry == null) continue;
+                raf.seek(entry.pointer);
+                for (int i = 0; i < entry.df; i++) {
+                    String line = raf.readLine();
+                    if (line == null) break;
+                    String[] p = line.split(" \\| ");
+                    if (p.length < 4) continue;
+                    int docId = Integer.parseInt(p[0].trim());
+                    List<Integer> positions = new ArrayList<>();
+                    for (String pos : p[2].trim().split(",")) {
+                        try { positions.add(Integer.parseInt(pos.trim())); }
+                        catch (NumberFormatException ignored) {}
+                    }
+                    long offset = Long.parseLong(p[3].trim());
+                    if (!result.containsKey(docId))
+                        result.put(docId, new DocPositions(offset, new ArrayList<>(positions)));
+                    else
+                        result.get(docId).positions.addAll(positions);
+                }
+            }
+        }
+        return result;
+    }
+
+    // Exact phrase search: documents where phraseStems appear consecutively
+    static List<Result> searchPhrase(List<String> phraseStems, int topK) throws IOException {
+        if (phraseStems.isEmpty()) return Collections.emptyList();
+        if (phraseStems.size() == 1) return search(phraseStems, topK);
+
+        List<Map<Integer, DocPositions>> allPostings = new ArrayList<>();
+        for (String stem : phraseStems) allPostings.add(loadStemPostings(stem));
+
+        // Candidate docs must contain every term
+        Set<Integer> candidates = new HashSet<>(allPostings.get(0).keySet());
+        for (int i = 1; i < allPostings.size(); i++) candidates.retainAll(allPostings.get(i).keySet());
+
+        List<Result> results = new ArrayList<>();
+        try (RandomAccessFile docsRaf = new RandomAccessFile(
+                INDEX_DIR + File.separator + "DocumentsFile.txt", "r")) {
+            for (int docId : candidates) {
+                List<Integer> firstPos = new ArrayList<>(allPostings.get(0).get(docId).positions);
+                Collections.sort(firstPos);
+                int phraseCount = 0;
+                for (int startPos : firstPos) {
+                    boolean match = true;
+                    for (int k = 1; k < phraseStems.size(); k++) {
+                        if (!allPostings.get(k).get(docId).positions.contains(startPos + k)) {
+                            match = false; break;
+                        }
+                    }
+                    if (match) phraseCount++;
+                }
+                if (phraseCount == 0) continue;
+
+                long offset = allPostings.get(0).get(docId).docOffset;
+                docsRaf.seek(offset);
+                String docLine = docsRaf.readLine();
+                if (docLine == null) continue;
+                String[] dp = docLine.split(" \\| ");
+                if (dp.length < 2) continue;
+                String path  = dp[1].trim();
+                String pmcid = new File(path).getName().replace(".nxml", "");
+                results.add(new Result(path, pmcid, phraseCount));
+            }
+        }
+        results.sort(null);
+        return results.subList(0, Math.min(topK, results.size()));
+    }
+
+    // -------------------------------------------------------------------------
+    // Rocchio pseudo-relevance feedback
+    // -------------------------------------------------------------------------
+
+    // Expands queryStems with high-scoring terms from the top feedback documents
+    static List<String> expandQueryRocchio(List<String> originalStems,
+                                           int feedbackDocs, int expandTerms) {
+        try {
+            List<Result> feedback = searchBM25(originalStems, feedbackDocs);
+            if (feedback.isEmpty()) return originalStems;
+
+            Map<String, Double> termScores = new HashMap<>();
+            for (Result r : feedback) {
+                try {
+                    NXMLFileReader reader = new NXMLFileReader(new File(r.path));
+                    String text = (reader.getTitle()  != null ? reader.getTitle()  : "")
+                                + " "
+                                + (reader.getAbstr() != null ? reader.getAbstr() : "");
+                    List<String> docStems = processQuery(text);
+                    Map<String, Long> tf  = docStems.stream()
+                        .collect(Collectors.groupingBy(s -> s, Collectors.counting()));
+                    for (Map.Entry<String, Long> e : tf.entrySet()) {
+                        String stem = e.getKey();
+                        List<String> words = stemToWords.getOrDefault(stem, Collections.emptyList());
+                        if (words.isEmpty()) continue;
+                        VocabEntry ve = vocabulary.get(words.get(0));
+                        if (ve == null || ve.df == 0) continue;
+                        double idf = Math.log((totalDocs - ve.df + 0.5) / (ve.df + 0.5) + 1.0);
+                        termScores.merge(stem, e.getValue() * idf / feedbackDocs, Double::sum);
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            Set<String> original = new HashSet<>(originalStems);
+            List<String> newTerms = termScores.entrySet().stream()
+                .filter(e -> !original.contains(e.getKey()))
+                .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
+                .limit(expandTerms)
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+
+            List<String> expanded = new ArrayList<>(originalStems);
+            expanded.addAll(newTerms);
+            return expanded;
+        } catch (Exception e) {
+            return originalStems;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Snippet + highlighting
+    // -------------------------------------------------------------------------
+
+    // Plain-text snippet (used by CLI)
     static String getSnippet(String docPath, List<String> queryStems) {
         try {
             NXMLFileReader reader = new NXMLFileReader(new File(docPath));
             String[] sources = { reader.getTitle(), reader.getAbstr(), reader.getBody() };
-
             for (String src : sources) {
                 if (src == null || src.isEmpty()) continue;
                 String[] words = src.split("\\s+");
                 for (int i = 0; i < words.length; i++) {
                     String cleaned = words[i].toLowerCase().replaceAll("[^\\p{L}\\p{Nd}]", "");
                     if (cleaned.isEmpty()) continue;
-                    String ws = Stemmer.Stem(cleaned);
-                    if (queryStems.contains(ws)) {
+                    if (queryStems.contains(Stemmer.Stem(cleaned))) {
                         int s = Math.max(0, i - 8);
                         int e = Math.min(words.length, i + 12);
                         StringBuilder sb = new StringBuilder(s > 0 ? "..." : "");
@@ -385,12 +562,145 @@ public class QueryEvaluator {
         return "(no snippet)";
     }
 
-    static void interactiveMode() throws Exception {
-        BufferedReader br = new BufferedReader(
-                new InputStreamReader(System.in, StandardCharsets.UTF_8));
-        String sep = "-".repeat(56);
+    // HTML snippet with <mark> highlighting around matched terms
+    static String getHighlightedSnippet(String docPath, List<String> queryStems) {
+        try {
+            NXMLFileReader reader = new NXMLFileReader(new File(docPath));
+            String[] sources = { reader.getTitle(), reader.getAbstr(), reader.getBody() };
+            for (String src : sources) {
+                if (src == null || src.isEmpty()) continue;
+                String[] words = src.split("\\s+");
+                for (int i = 0; i < words.length; i++) {
+                    String cleaned = words[i].toLowerCase().replaceAll("[^\\p{L}\\p{Nd}]", "");
+                    if (cleaned.isEmpty()) continue;
+                    if (queryStems.contains(Stemmer.Stem(cleaned))) {
+                        int s = Math.max(0, i - 8);
+                        int e = Math.min(words.length, i + 12);
+                        StringBuilder sb = new StringBuilder(s > 0 ? "... " : "");
+                        for (int j = s; j < e; j++) {
+                            String w  = words[j];
+                            String wc = w.toLowerCase().replaceAll("[^\\p{L}\\p{Nd}]", "");
+                            String ws = wc.isEmpty() ? "" : Stemmer.Stem(wc);
+                            if (!ws.isEmpty() && queryStems.contains(ws))
+                                sb.append("<mark>").append(htmlEncode(w)).append("</mark>");
+                            else
+                                sb.append(htmlEncode(w));
+                            if (j < e - 1) sb.append(' ');
+                        }
+                        if (e < words.length) sb.append(" ...");
+                        return sb.toString();
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return "(no snippet)";
+    }
 
-        System.out.println("\nMedIR  [" + MODEL.toUpperCase() + "]  —  'exit' to quit, prefix ':' for snippet\n");
+    static String htmlEncode(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
+    }
+
+    // -------------------------------------------------------------------------
+    // Autocomplete
+    // -------------------------------------------------------------------------
+
+    // Vocabulary terms starting with prefix, sorted by document frequency desc
+    static List<String> getAutocompleteSuggestions(String prefix, int topK) {
+        if (prefix == null || prefix.length() < 2) return Collections.emptyList();
+        String p = prefix.toLowerCase();
+        return vocabulary.entrySet().stream()
+            .filter(e -> e.getKey().startsWith(p))
+            .sorted(Comparator.comparingInt((Map.Entry<String, VocabEntry> e) -> e.getValue().df).reversed())
+            .limit(topK)
+            .map(Map.Entry::getKey)
+            .collect(Collectors.toList());
+    }
+
+    // -------------------------------------------------------------------------
+    // Document similarity
+    // -------------------------------------------------------------------------
+
+    // Finds documents similar to a given PMCID using its title+abstract as a query
+    static List<Result> getSimilarDocs(String pmcid, int topK) throws IOException {
+        String docPath = null;
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(
+                new FileInputStream(INDEX_DIR + File.separator + "DocumentsFile.txt"),
+                StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.contains(pmcid)) {
+                    String[] p = line.split(" \\| ");
+                    if (p.length >= 2) { docPath = p[1].trim(); break; }
+                }
+            }
+        }
+        if (docPath == null) return Collections.emptyList();
+        try {
+            NXMLFileReader reader = new NXMLFileReader(new File(docPath));
+            String text = (reader.getTitle()  != null ? reader.getTitle()  : "")
+                        + " "
+                        + (reader.getAbstr() != null ? reader.getAbstr() : "");
+            if (text.length() > 600) text = text.substring(0, 600);
+
+            List<String> allStems = processQuery(text);
+            Map<String, Long> tf  = allStems.stream()
+                .collect(Collectors.groupingBy(s -> s, Collectors.counting()));
+
+            // Keep terms that are informative (not too rare, not ubiquitous)
+            List<String> topStems = tf.entrySet().stream()
+                .filter(e -> {
+                    List<String> ws = stemToWords.getOrDefault(e.getKey(), Collections.emptyList());
+                    if (ws.isEmpty()) return false;
+                    VocabEntry ve = vocabulary.get(ws.get(0));
+                    return ve != null && ve.df > 1 && ve.df < totalDocs;
+                })
+                .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+                .limit(15)
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+
+            return searchBM25(topStems, topK + 1).stream()
+                .filter(r -> !r.pmcid.equals(pmcid))
+                .limit(topK)
+                .collect(Collectors.toList());
+        } catch (Exception e) {
+            return Collections.emptyList();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Filtering
+    // -------------------------------------------------------------------------
+
+    static List<Result> filterByType(List<Result> results, String type, int topK) {
+        if (type == null || "all".equalsIgnoreCase(type))
+            return results.subList(0, Math.min(topK, results.size()));
+        String token    = File.separator + type.toLowerCase() + File.separator;
+        String altToken = "/" + type.toLowerCase() + "/";
+        List<Result> filtered = new ArrayList<>();
+        for (Result r : results) {
+            String p = r.path.toLowerCase();
+            if (p.contains(token) || p.contains(altToken)) {
+                filtered.add(r);
+                if (filtered.size() == topK) break;
+            }
+        }
+        return filtered;
+    }
+
+    // -------------------------------------------------------------------------
+    // Interactive CLI
+    // -------------------------------------------------------------------------
+
+    static void interactiveMode() throws Exception {
+        BufferedReader br  = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+        String         sep = "-".repeat(56);
+
+        System.out.println("\nMedIR  [" + MODEL.toUpperCase() + "]");
+        System.out.println("Phrase queries: use quotes, e.g.  \"chest pain\"");
+        System.out.println("Query expansion: prefix with +,  e.g.  +myocardial");
+        System.out.println("'exit' to quit, prefix ':' for snippet\n");
 
         while (true) {
             System.out.print("> ");
@@ -402,17 +712,41 @@ public class QueryEvaluator {
             boolean showSnip = SHOW_SNIPPET || input.startsWith(":");
             if (input.startsWith(":")) input = input.substring(1).trim();
 
-            long         t0    = System.currentTimeMillis();
-            List<String> stems = processQuery(input);
+            // Optional query expansion flag
+            boolean doExpand = input.startsWith("+");
+            if (doExpand) input = input.substring(1).trim();
 
-            if (stems.isEmpty()) {
+            long t0 = System.currentTimeMillis();
+
+            // Parse phrases
+            List<List<String>> phrases = new ArrayList<>();
+            List<String>       stems   = extractPhrases(input, phrases);
+
+            if (stems.isEmpty() && phrases.isEmpty()) {
                 System.out.println("No indexable terms.\n");
                 continue;
             }
 
+            // OOV info
+            Map<String, List<String>> oov = getOovInfo(stems);
+            if (!oov.isEmpty()) {
+                for (Map.Entry<String, List<String>> e : oov.entrySet())
+                    System.out.println("  [OOV] \"" + e.getKey() + "\" -> suggestions: " + e.getValue());
+            }
+
+            // Rocchio expansion
+            List<String> expandedTerms = Collections.emptyList();
+            if (doExpand && !stems.isEmpty()) {
+                List<String> expanded = expandQueryRocchio(stems, ROCCHIO_FEEDBACK_DOCS, ROCCHIO_EXPAND_TERMS);
+                expandedTerms = expanded.subList(stems.size(), expanded.size());
+                stems = expanded;
+                if (!expandedTerms.isEmpty())
+                    System.out.println("  [expand] added: " + expandedTerms);
+            }
+
             int          fetchK  = (TYPE_FILTER != null && !"all".equalsIgnoreCase(TYPE_FILTER)) ? TOP_K * 20 : TOP_K;
-            List<Result> raw     = search(stems, fetchK);
-            List<Result> results = filterByType(raw, TYPE_FILTER, TOP_K);
+            List<Result> results = runCombinedSearch(stems, phrases, MODEL, fetchK);
+            results = filterByType(results, TYPE_FILTER, TOP_K);
             long elapsed = System.currentTimeMillis() - t0;
 
             System.out.println();
@@ -427,48 +761,70 @@ public class QueryEvaluator {
         System.out.println("Bye.");
     }
 
-    static List<Result> filterByType(List<Result> results, String type, int topK) {
-        if (type == null || "all".equalsIgnoreCase(type)) {
-            return results.subList(0, Math.min(topK, results.size()));
+    // Combined bag-of-words + phrase search
+    static List<Result> runCombinedSearch(List<String> stems,
+                                          List<List<String>> phrases,
+                                          String model,
+                                          int topK) throws IOException {
+        if (phrases.isEmpty()) {
+            return "bm25".equalsIgnoreCase(model) ? searchBM25(stems, topK) : searchVSM(stems, topK);
         }
-        String token = File.separator + type.toLowerCase() + File.separator;
-        String altToken = "/" + type.toLowerCase() + "/";
-        List<Result> filtered = new ArrayList<>();
-        for (Result r : results) {
-            String p = r.path.toLowerCase();
-            if (p.contains(token) || p.contains(altToken)) {
-                filtered.add(r);
-                if (filtered.size() == topK) break;
-            }
+
+        // Gather docs satisfying all phrase constraints
+        Set<String> phraseMatchPmcids = null;
+        for (List<String> phrase : phrases) {
+            List<Result> pm = searchPhrase(phrase, totalDocs);
+            Set<String> pmcids = pm.stream().map(r -> r.pmcid).collect(Collectors.toSet());
+            if (phraseMatchPmcids == null) phraseMatchPmcids = new HashSet<>(pmcids);
+            else phraseMatchPmcids.retainAll(pmcids);
         }
-        return filtered;
+
+        if (stems.isEmpty()) {
+            // Pure phrase query: score by phrase occurrence count
+            List<Result> phraseResults = new ArrayList<>();
+            for (List<String> phrase : phrases) phraseResults.addAll(searchPhrase(phrase, topK));
+            phraseResults.sort(null);
+            return phraseResults.subList(0, Math.min(topK, phraseResults.size()));
+        }
+
+        // Mixed: rank by model score, filtered by phrase constraint
+        List<Result> base = "bm25".equalsIgnoreCase(model)
+            ? searchBM25(stems, topK * 5)
+            : searchVSM(stems, topK * 5);
+
+        final Set<String> matchSet = phraseMatchPmcids != null ? phraseMatchPmcids : Collections.emptySet();
+        List<Result> filtered = base.stream()
+            .filter(r -> matchSet.contains(r.pmcid))
+            .collect(Collectors.toList());
+
+        // If phrase constraint eliminates everything, fall back to plain bag-of-words
+        return filtered.isEmpty() ? base : filtered;
     }
+
+    // -------------------------------------------------------------------------
+    // Topics batch mode
+    // -------------------------------------------------------------------------
 
     static void processTopics(String topicsFile, String useField) throws Exception {
         ArrayList<Topic> topics = TopicsReader.readTopics(topicsFile);
-        System.out.printf("Processing %d topics  (field = %s, type filter = %s)%n%n",
-                topics.size(), useField, TYPE_FILTER == null ? "auto-by-topic" : TYPE_FILTER);
+        System.out.printf("Processing %d topics  (field=%s  type=%s)%n%n",
+                topics.size(), useField, TYPE_FILTER == null ? "auto" : TYPE_FILTER);
 
         for (Topic topic : topics) {
             String text = "description".equals(useField)
-                    ? topic.getDescription()
-                    : topic.getSummary();
-
+                    ? topic.getDescription() : topic.getSummary();
             String type = TYPE_FILTER != null ? TYPE_FILTER : String.valueOf(topic.getType());
 
-            System.out.printf("Topic %2d [%-11s]: %s%n",
-                    topic.getNumber(), topic.getType(), text);
+            System.out.printf("Topic %2d [%-11s]: %s%n", topic.getNumber(), topic.getType(), text);
 
-            List<String> stems  = processQuery(text);
-            int          fetchK = (type != null && !"all".equalsIgnoreCase(type)) ? TOP_K * 20 : TOP_K;
-            List<Result> raw    = search(stems, fetchK);
-            List<Result> results = filterByType(raw, type, TOP_K);
+            List<String> stems   = processQuery(text);
+            int          fetchK  = (type != null && !"all".equalsIgnoreCase(type)) ? TOP_K * 20 : TOP_K;
+            List<Result> results = filterByType(search(stems, fetchK), type, TOP_K);
 
             for (int i = 0; i < results.size(); i++) {
                 Result r = results.get(i);
                 System.out.printf("  %2d. [%.5f] %s%n", i + 1, r.score, r.path);
-                if (SHOW_SNIPPET)
-                    System.out.println("       Snippet: " + getSnippet(r.path, stems));
+                if (SHOW_SNIPPET) System.out.println("       " + getSnippet(r.path, stems));
             }
             System.out.println();
         }

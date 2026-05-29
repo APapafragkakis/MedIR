@@ -1,8 +1,11 @@
 # MedIR
 
-MedIR is a full information retrieval system for clinical medical literature. It builds an inverted index over a collection of PubMed Central articles, ranks documents using both **VSM** (tf·idf cosine similarity) and **BM25**, and evaluates retrieval quality with standard IR metrics.
+MedIR is a full information retrieval system for clinical medical literature. It builds an inverted index (with positional information) over a collection of PubMed Central articles and exposes retrieval through four interfaces: an interactive CLI, a desktop GUI, a REST API with a browser-based search UI, and a batch evaluation pipeline.
 
-Built on the TREC Clinical Decision Support track dataset, it supports three query types (diagnosis, test, treatment) and ships with a desktop GUI, an interactive CLI, a REST API with a browser-based search UI, and a batch evaluation pipeline that compares VSM and BM25 side-by-side.
+**Ranking models:** VSM (tf·idf cosine similarity) and BM25  
+**Advanced features:** phrase queries, Rocchio pseudo-relevance feedback, spelling correction, autocomplete, document similarity, snippet highlighting
+
+Built on the TREC Clinical Decision Support track dataset — three query types: diagnosis, test, treatment.
 
 ---
 
@@ -16,7 +19,8 @@ Built on the TREC Clinical Decision Support track dataset, it supports three que
 From the project root:
 
 ```bash
-javac -cp "src/libs/BioReader.jar;src/libs/Stemmer.jar" -d out src/indexer/Indexer.java src/queryeval/*.java
+javac -cp "src/libs/BioReader.jar;src/libs/Stemmer.jar" -d out \
+  src/indexer/Indexer.java src/queryeval/*.java
 ```
 
 Package jars:
@@ -41,23 +45,30 @@ Pre-built jars are already in `dist/`.
 java -jar dist/indexer.jar
 ```
 
-Reads `.nxml` files from `dataset/clinic/` and writes the inverted index to `CollectionIndex/`.
+Reads `.nxml` files from `dataset/clinic/` and writes the inverted index (vocabulary, postings with positions, documents) to `CollectionIndex/`.
 
-**Query (CLI)**
+**Query — CLI**
 
 ```bash
 java -jar dist/queryevaluator.jar [--model vsm|bm25] [--topk N] [--type diagnosis|test|treatment] [--snippet]
 ```
 
-Default model is BM25. Prefix query with `:` to show a snippet.
+- Default model is BM25.
+- Prefix query with `:` to show snippets.
+- Use `"quotes"` in the query for exact phrase matching (positional index).
+- Prefix with `+` to trigger Rocchio query expansion.
 
-**Query (GUI)**
+**Query — GUI**
 
 ```bash
 java -jar dist/queryevaluatorgui.jar
 ```
 
-Switch between VSM and BM25 from the dropdown. Results show rank, score, and a snippet.
+- Choose model (BM25 / VSM) and type from the toolbar.
+- Check **Expand** for Rocchio pseudo-relevance feedback.
+- Phrase queries with `"quotes"` are supported.
+- Results show rank, score, document type, and a highlighted snippet.
+- Click any result to view the full title, abstract (with highlights), and metadata.
 
 **REST API + Web UI**
 
@@ -65,13 +76,16 @@ Switch between VSM and BM25 from the dropdown. Results show rank, score, and a s
 java -jar dist/server.jar
 ```
 
-Starts an HTTP server at `http://localhost:8080`. Open it in a browser for the search UI, or hit the API directly:
+Starts an HTTP server at `http://localhost:8080`. Open in a browser for the full search UI, or call the API directly.
 
-```
-GET /search?q=chest+pain&type=diagnosis&model=bm25&topk=10
-```
+| Endpoint | Description |
+|----------|-------------|
+| `GET /search?q=...&type=...&model=...&topk=...&expand=true` | Full-text search with BM25 or VSM |
+| `GET /suggest?prefix=...` | Autocomplete — vocabulary terms by prefix, sorted by df |
+| `GET /similar?pmcid=...&topk=N` | Find documents similar to a given article |
+| `GET /stats` | Index statistics (vocabulary size, doc count, top terms) |
 
-Returns JSON with ranked results, scores, snippets, and elapsed time.
+Web UI features: autocomplete dropdown, highlighted snippets (`<mark>`), query expansion indicator, "did you mean?" for OOV terms, similar-docs modal, document type badges, and export to CSV.
 
 **Evaluate retrieval quality**
 
@@ -79,10 +93,32 @@ Returns JSON with ranked results, scores, snippets, and elapsed time.
 java -jar dist/evaluator.jar [--model vsm|bm25|both]
 ```
 
-Default is `both` — runs VSM and BM25 and prints a side-by-side comparison. Outputs to `doc/`:
+Default is `both` — runs VSM and BM25 side-by-side. Outputs to `doc/`:
 - `eval_results.txt` — per-topic metrics (TSV)
 - `results.txt` — TREC run format
 - `qrels.txt` — relevance judgments (TREC format)
+
+---
+
+## Advanced Features
+
+### Phrase Queries
+Wrap terms in double quotes to require exact consecutive positions: `"chest pain"`. Implemented using the positional inverted index — matching documents must contain the complete sequence at adjacent token offsets.
+
+### Rocchio Query Expansion
+Pseudo-relevance feedback: the top-3 retrieved documents are used as feedback. Terms are scored by `tf × IDF` across the feedback set; the top-5 unseen terms are appended to the original query before re-ranking. Enabled with `+` in CLI, **Expand** checkbox in GUI/web.
+
+### Spelling Correction (OOV handling)
+Any query stem not found in the vocabulary is matched against known vocabulary stems using edit distance (Levenshtein ≤ 2, constrained by shared prefix for efficiency). Suggestions are substituted transparently during search and exposed in the API as `oov` field.
+
+### Autocomplete
+`/suggest?prefix=<prefix>` returns up to 8 vocabulary terms starting with that prefix, ranked by document frequency. The web UI calls this on every keystroke (200 ms debounce) and renders a dropdown with keyboard navigation.
+
+### Document Similarity
+`/similar?pmcid=<id>` extracts terms from the target document's title and abstract, filters to informative terms (df > 1 and df < N), and runs a BM25 search excluding the source document.
+
+### Design Pattern — Proxy
+`CachingQueryEngineProxy` wraps `RealQueryEngine` (which implements `IQueryEngine`) and memoises search results by `(stems, type, topK)` key. Used during batch evaluation to avoid redundant I/O when the same topic is evaluated across multiple models.
 
 ---
 
@@ -90,14 +126,14 @@ Default is `both` — runs VSM and BM25 and prints a side-by-side comparison. Ou
 
 ```
 src/
-  indexer/        inverted index builder
-  queryeval/      VSM + BM25 retrieval, GUI, REST API, IR evaluation
+  indexer/        inverted index builder (positional, doc-length aware)
+  queryeval/      VSM, BM25, phrase search, Rocchio, GUI, REST API, IR evaluation
   libs/           BioReader.jar, Stemmer.jar
 dist/             compiled jars
 doc/              evaluation output
 Stopwords/        English and Greek stopword lists
 CollectionIndex/  generated index files (created by indexer)
-dataset/          MiniCollection – 54 documents, 6 topics
+dataset/          MiniCollection — 54 documents, 6 topics
 topics.xml        TREC-style topic definitions
 ```
 
@@ -110,6 +146,4 @@ topics.xml        TREC-style topic definitions
 | VSM   | 0.7268 | 0.5167 | 0.8043  | 0.7083 |
 | BM25  | 0.5509 | 0.4667 | 0.6987  | 0.5417 |
 
-VSM outperforms BM25 on this small collection (54 docs). BM25's length normalization penalizes the longer, more relevant clinical articles. On larger corpora the gap typically closes or reverses.
-
-Uses a **Proxy pattern** (`CachingQueryEngineProxy`) to cache search results across evaluation topics.
+VSM outperforms BM25 on this small collection (54 docs). BM25's length normalisation penalises the longer, more relevant clinical articles. On larger corpora the gap typically closes or reverses.
