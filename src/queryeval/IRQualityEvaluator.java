@@ -103,7 +103,7 @@ public class IRQualityEvaluator {
         Map<Integer, Map<String, Integer>> qrels = buildQrelsFromDir(datasetDir);
         System.out.println("Ground truth for " + qrels.size() + " topics");
 
-        // Write qrels.txt (TREC format: topicID 0 docID relevance)
+        // Write qrels.txt 
         writeQrelsTrec(qrelsOut, qrels);
 
         // Only evaluate topics that have ground truth
