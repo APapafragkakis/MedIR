@@ -21,9 +21,7 @@ public class IRQualityEvaluator {
         @Override
         public List<QueryEvaluator.Result> search(List<String> stems, String topicType, int topK) throws Exception {
             int fetchK = topK * 20;
-            List<QueryEvaluator.Result> raw = "bm25".equalsIgnoreCase(model)
-                ? QueryEvaluator.searchBM25(stems, fetchK)
-                : QueryEvaluator.searchVSM(stems, fetchK);
+            List<QueryEvaluator.Result> raw = QueryEvaluator.searchByModel(stems, fetchK, model);
             return QueryEvaluator.filterByType(raw, topicType, topK);
         }
     }
@@ -109,8 +107,9 @@ public class IRQualityEvaluator {
         }
         System.out.println("Evaluating " + evalTopics.size() + " topics\n");
 
-        List<String> modelsToRun = "both".equalsIgnoreCase(model)
-            ? Arrays.asList("vsm", "bm25")
+        List<String> modelsToRun =
+              "both".equalsIgnoreCase(model) ? Arrays.asList("vsm", "bm25")
+            : "all".equalsIgnoreCase(model)  ? Arrays.asList("vsm", "bm25", "semantic", "hybrid")
             : Collections.singletonList(model.toLowerCase());
 
         Map<String, List<TopicMetrics>> allModelMetrics = new LinkedHashMap<>();

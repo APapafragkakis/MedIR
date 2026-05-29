@@ -2,6 +2,7 @@ package indexer;
 
 import gr.uoc.csd.hy463.NXMLFileReader;
 import mitos.stemmer.Stemmer;
+import queryeval.SemanticModel;
 
 import java.io.*;
 import java.net.URISyntaxException;
@@ -82,6 +83,7 @@ public class Indexer {
             System.out.print("Writing index files... ");
             createDocumentsFile();
             createPostingFile();
+            buildSemanticModel();
         }
         printResults();
     }
@@ -246,5 +248,67 @@ public class Indexer {
 
         vocabWriter.close();
         System.out.println("done.");
+    }
+
+    static void buildSemanticModel() throws IOException {
+        int N = docPaths.size();
+        if (N < 2) return;
+        List<String> docOrder = new ArrayList<>(docPaths.keySet());
+
+        Map<String, Map<String, Double>> docStemTf = new LinkedHashMap<>();
+        for (String docID : docOrder) docStemTf.put(docID, new HashMap<>());
+
+        for (Map.Entry<String, Map<String, Map<String, Integer>>> we : index.entrySet()) {
+            String stem = Stemmer.Stem(we.getKey());
+            if (stem == null || stem.isEmpty()) stem = we.getKey();
+            for (Map.Entry<String, Map<String, Integer>> de : we.getValue().entrySet()) {
+                int tf = 0;
+                for (int c : de.getValue().values()) tf += c;
+                Map<String, Double> m = docStemTf.get(de.getKey());
+                if (m != null) m.merge(stem, (double) tf, Double::sum);
+            }
+        }
+
+        Map<String, Integer> stemDf = new HashMap<>();
+        for (Map<String, Double> m : docStemTf.values())
+            for (String stem : m.keySet()) stemDf.merge(stem, 1, Integer::sum);
+
+        List<String> stemList = new ArrayList<>(stemDf.keySet());
+        Collections.sort(stemList);
+        Map<String, Integer> colOf = new HashMap<>();
+        double[] idf = new double[stemList.size()];
+        for (int i = 0; i < stemList.size(); i++) {
+            colOf.put(stemList.get(i), i);
+            idf[i] = Math.log((double) N / stemDf.get(stemList.get(i)));
+        }
+
+        int[]      docNums = new int[N];
+        String[]   pmcids  = new String[N];
+        int[][]    rowCols = new int[N][];
+        double[][] rowVals = new double[N][];
+        for (int r = 0; r < N; r++) {
+            String docID = docOrder.get(r);
+            docNums[r] = docNumericID.get(docID);
+            pmcids[r]  = docID.replace(".nxml", "");
+            Map<String, Double> m = docStemTf.get(docID);
+            int[] cols = new int[m.size()];
+            double[] vals = new double[m.size()];
+            int j = 0;
+            for (Map.Entry<String, Double> e : m.entrySet()) {
+                int c = colOf.get(e.getKey());
+                cols[j] = c;
+                vals[j] = e.getValue() * idf[c];
+                j++;
+            }
+            rowCols[r] = cols;
+            rowVals[r] = vals;
+        }
+
+        String indexDir = BASE_DIR + File.separator + "CollectionIndex";
+        int kReq = Math.min(160, N);
+        System.out.print("Building LSA embeddings... ");
+        SemanticModel.build(indexDir, docNums, pmcids,
+                stemList.toArray(new String[0]), idf, rowCols, rowVals, kReq);
+        System.out.println("done (" + stemList.size() + " stems).");
     }
 }

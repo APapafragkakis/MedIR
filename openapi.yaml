@@ -1,0 +1,127 @@
+openapi: 3.0.3
+info:
+  title: MedIR Search API
+  description: >
+    REST API for the MedIR clinical information-retrieval engine. Supports four
+    ranking models (BM25, VSM, LSA semantic, and hybrid via reciprocal rank
+    fusion), phrase / boolean / proximity / wildcard queries, Rocchio
+    pseudo-relevance feedback, spelling correction, autocomplete, document
+    similarity, and a latent-space document map.
+  version: "3.0"
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:8080
+    description: Local server
+paths:
+  /search:
+    get:
+      summary: Full-text search
+      description: Ranked retrieval over the inverted index with the chosen model.
+      parameters:
+        - { name: q,      in: query, required: true,  schema: { type: string }, description: 'Query text. Use "quotes" for phrases, AND/OR/NOT, prefix* wildcards, "a b"~N proximity.' }
+        - { name: model,  in: query, required: false, schema: { type: string, enum: [bm25, vsm, semantic, hybrid], default: bm25 } }
+        - { name: type,   in: query, required: false, schema: { type: string, enum: [all, diagnosis, test, treatment], default: all } }
+        - { name: topk,   in: query, required: false, schema: { type: integer, default: 10 } }
+        - { name: expand, in: query, required: false, schema: { type: boolean, default: false }, description: Rocchio pseudo-relevance feedback. }
+      responses:
+        '200':
+          description: Ranked results
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResponse' }
+        '400': { description: Missing query }
+  /suggest:
+    get:
+      summary: Autocomplete
+      parameters:
+        - { name: prefix, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Up to 8 vocabulary terms by descending document frequency
+          content:
+            application/json:
+              schema: { type: array, items: { type: string } }
+  /similar:
+    get:
+      summary: More-like-this
+      parameters:
+        - { name: pmcid, in: query, required: true,  schema: { type: string } }
+        - { name: topk,  in: query, required: false, schema: { type: integer, default: 5 } }
+      responses:
+        '200': { description: Similar documents }
+  /map:
+    get:
+      summary: Latent-space document map
+      description: 2D LSA projection of every document plus unsupervised k-means clusters.
+      parameters:
+        - { name: clusters, in: query, required: false, schema: { type: integer, minimum: 2, maximum: 8, default: 4 } }
+      responses:
+        '200':
+          description: Document coordinates and cluster keywords
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MapResponse' }
+  /stats:
+    get:
+      summary: Index statistics
+      responses:
+        '200': { description: Vocabulary size, document count, top terms }
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: Service status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:      { type: string, example: ok }
+                  terms:       { type: integer }
+                  docs:        { type: integer }
+                  semantic:    { type: boolean }
+                  latent_dims: { type: integer }
+components:
+  schemas:
+    SearchResponse:
+      type: object
+      properties:
+        query:          { type: string }
+        model:          { type: string }
+        type:           { type: string }
+        elapsed_ms:     { type: integer }
+        stems:          { type: array, items: { type: string } }
+        expanded_terms: { type: array, items: { type: string } }
+        oov:            { type: object, additionalProperties: { type: array, items: { type: string } } }
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              rank:    { type: integer }
+              pmcid:   { type: string }
+              score:   { type: number }
+              type:    { type: string }
+              snippet: { type: string }
+    MapResponse:
+      type: object
+      properties:
+        docs:
+          type: array
+          items:
+            type: object
+            properties:
+              pmcid:   { type: string }
+              x:       { type: number }
+              y:       { type: number }
+              type:    { type: string }
+              cluster: { type: integer }
+        clusters:
+          type: array
+          items:
+            type: object
+            properties:
+              id:       { type: integer }
+              keywords: { type: array, items: { type: string } }

@@ -4,6 +4,7 @@
 
 # Compiled output
 out/
+out_new/
 
 # Generated index (rebuild with indexer.jar)
 CollectionIndex/

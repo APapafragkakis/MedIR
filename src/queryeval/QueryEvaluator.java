@@ -15,6 +15,8 @@ import java.util.stream.*;
 
 public class QueryEvaluator {
 
+    static final String VERSION = "2.0";
+
     static String  INDEX_DIR    = "CollectionIndex";
     static String  STOPWORDS_EN = "Stopwords/stopwordsEn.txt";
     static String  STOPWORDS_GR = "Stopwords/stopwordsGr.txt";
@@ -27,13 +29,18 @@ public class QueryEvaluator {
     static final Set<String>               stopwords   = new HashSet<>();
     static int    totalDocs = 0;
     static double avgDocLen = 0;
-    static final Map<Integer, Integer> docLengths = new HashMap<>();
+    static final Map<Integer, Integer> docLengths  = new HashMap<>();
+    static final Map<Integer, String>  docPathById = new HashMap<>();
     static String MODEL = "bm25";
 
     static final double BM25_K1 = 1.5;
     static final double BM25_B  = 0.75;
     static final int ROCCHIO_FEEDBACK_DOCS = 3;
     static final int ROCCHIO_EXPAND_TERMS  = 5;
+    static final int RRF_K = 60;
+
+    static SemanticModel semantic = null;
+    static boolean       semanticTried = false;
 
     static class VocabEntry {
         final String stem;
@@ -150,6 +157,7 @@ public class QueryEvaluator {
                     int docNum = Integer.parseInt(p[0].trim());
                     int len    = Integer.parseInt(p[3].trim());
                     docLengths.put(docNum, len);
+                    docPathById.put(docNum, p[1].trim());
                     avgDocLen += len;
                 }
             }
@@ -360,9 +368,59 @@ public class QueryEvaluator {
     }
 
     static List<Result> search(List<String> queryStems, int topK) throws IOException {
-        return "bm25".equalsIgnoreCase(MODEL)
-            ? searchBM25(queryStems, topK)
-            : searchVSM(queryStems, topK);
+        return searchByModel(queryStems, topK, MODEL);
+    }
+
+    static List<Result> searchByModel(List<String> stems, int topK, String model) throws IOException {
+        if ("hybrid".equalsIgnoreCase(model))   return searchHybrid(stems, topK);
+        if ("semantic".equalsIgnoreCase(model)) return searchSemantic(stems, topK);
+        if ("bm25".equalsIgnoreCase(model))     return searchBM25(stems, topK);
+        return searchVSM(stems, topK);
+    }
+
+    static void ensureSemantic() {
+        if (semantic == null && !semanticTried) {
+            semanticTried = true;
+            semantic = SemanticModel.load(INDEX_DIR);
+        }
+    }
+
+    static List<Result> searchSemantic(List<String> queryStems, int topK) throws IOException {
+        ensureSemantic();
+        if (semantic == null || queryStems.isEmpty()) return Collections.emptyList();
+        List<Result> results = new ArrayList<>();
+        for (double[] ds : semantic.rankScored(queryStems, topK)) {
+            String path = docPathById.get((int) ds[0]);
+            if (path == null) continue;
+            results.add(new Result(path, pmcidOf(path), ds[1]));
+        }
+        return results;
+    }
+
+    static List<Result> searchHybrid(List<String> queryStems, int topK) throws IOException {
+        ensureSemantic();
+        int pool = Math.max(topK, 50);
+        List<Result> bm  = searchBM25(queryStems, pool);
+        List<Result> sem = (semantic != null) ? searchSemantic(queryStems, pool) : Collections.emptyList();
+        if (sem.isEmpty()) return bm.subList(0, Math.min(topK, bm.size()));
+
+        Map<String, Double> fused  = new LinkedHashMap<>();
+        Map<String, String> pathOf = new HashMap<>();
+        for (int i = 0; i < bm.size(); i++) {
+            Result r = bm.get(i);
+            fused.merge(r.pmcid, 1.0 / (RRF_K + i + 1), Double::sum);
+            pathOf.putIfAbsent(r.pmcid, r.path);
+        }
+        for (int i = 0; i < sem.size(); i++) {
+            Result r = sem.get(i);
+            fused.merge(r.pmcid, 1.0 / (RRF_K + i + 1), Double::sum);
+            pathOf.putIfAbsent(r.pmcid, r.path);
+        }
+        List<Result> out = new ArrayList<>();
+        for (Map.Entry<String, Double> e : fused.entrySet())
+            out.add(new Result(pathOf.get(e.getKey()), e.getKey(), e.getValue()));
+        out.sort(null);
+        return out.subList(0, Math.min(topK, out.size()));
     }
 
     static Map<Integer, DocPositions> loadStemPostings(String stem) throws IOException {
@@ -619,13 +677,195 @@ public class QueryEvaluator {
         return filtered;
     }
 
+    static String pmcidOf(String path) {
+        return new File(path).getName().replace(".nxml", "");
+    }
+
+    static Set<Integer> allDocIds() {
+        return new HashSet<>(docPathById.keySet());
+    }
+
+    static Set<Integer> termDocIds(String stem) throws IOException {
+        return new HashSet<>(loadStemPostings(stem).keySet());
+    }
+
+    static List<String> wildcardStems(String prefix) {
+        String p = prefix.toLowerCase();
+        Set<String> stems = new LinkedHashSet<>();
+        for (Map.Entry<String, VocabEntry> e : vocabulary.entrySet())
+            if (e.getKey().startsWith(p)) stems.add(e.getValue().stem);
+        return new ArrayList<>(stems);
+    }
+
+    static Set<Integer> wildcardDocIds(String prefix) throws IOException {
+        Set<Integer> docs = new HashSet<>();
+        for (String stem : wildcardStems(prefix)) docs.addAll(termDocIds(stem));
+        return docs;
+    }
+
+    static Set<Integer> phraseDocIds(List<String> phraseStems) throws IOException {
+        Set<Integer> hits = new HashSet<>();
+        if (phraseStems.isEmpty()) return hits;
+        if (phraseStems.size() == 1) return termDocIds(phraseStems.get(0));
+
+        List<Map<Integer, DocPositions>> postings = new ArrayList<>();
+        for (String stem : phraseStems) postings.add(loadStemPostings(stem));
+
+        Set<Integer> candidates = new HashSet<>(postings.get(0).keySet());
+        for (int i = 1; i < postings.size(); i++) candidates.retainAll(postings.get(i).keySet());
+
+        for (int docId : candidates) {
+            for (int startPos : postings.get(0).get(docId).positions) {
+                boolean match = true;
+                for (int k = 1; k < phraseStems.size(); k++) {
+                    if (!postings.get(k).get(docId).positions.contains(startPos + k)) { match = false; break; }
+                }
+                if (match) { hits.add(docId); break; }
+            }
+        }
+        return hits;
+    }
+
+    static Set<Integer> proximityDocIds(List<String> stems, int window) throws IOException {
+        Set<Integer> hits = new HashSet<>();
+        if (stems.isEmpty()) return hits;
+        if (stems.size() == 1) return termDocIds(stems.get(0));
+
+        List<Map<Integer, DocPositions>> postings = new ArrayList<>();
+        for (String stem : stems) postings.add(loadStemPostings(stem));
+
+        Set<Integer> candidates = new HashSet<>(postings.get(0).keySet());
+        for (int i = 1; i < postings.size(); i++) candidates.retainAll(postings.get(i).keySet());
+
+        for (int docId : candidates) {
+            List<List<Integer>> lists = new ArrayList<>();
+            for (Map<Integer, DocPositions> post : postings) {
+                List<Integer> pos = new ArrayList<>(post.get(docId).positions);
+                Collections.sort(pos);
+                lists.add(pos);
+            }
+            if (minWindowSpan(lists) <= window) hits.add(docId);
+        }
+        return hits;
+    }
+
+    static int minWindowSpan(List<List<Integer>> lists) {
+        int k = lists.size();
+        PriorityQueue<int[]> pq = new PriorityQueue<>(Comparator.comparingInt(a -> a[0]));
+        int curMax = Integer.MIN_VALUE;
+        for (int i = 0; i < k; i++) {
+            if (lists.get(i).isEmpty()) return Integer.MAX_VALUE;
+            int v = lists.get(i).get(0);
+            pq.offer(new int[]{v, i, 0});
+            curMax = Math.max(curMax, v);
+        }
+        int best = Integer.MAX_VALUE;
+        while (pq.size() == k) {
+            int[] top = pq.poll();
+            best = Math.min(best, curMax - top[0]);
+            int list = top[1], idx = top[2];
+            if (idx + 1 < lists.get(list).size()) {
+                int nv = lists.get(list).get(idx + 1);
+                pq.offer(new int[]{nv, list, idx + 1});
+                curMax = Math.max(curMax, nv);
+            }
+        }
+        return best;
+    }
+
+    static List<Result> rankWithinSet(Set<Integer> docIds, List<String> positiveStems,
+                                      String model, int topK) throws IOException {
+        if (docIds.isEmpty()) return Collections.emptyList();
+
+        Set<String> allowedPaths = new HashSet<>();
+        for (int id : docIds) {
+            String path = docPathById.get(id);
+            if (path != null) allowedPaths.add(path);
+        }
+
+        if (positiveStems == null || positiveStems.isEmpty()) {
+            List<Result> plain = new ArrayList<>();
+            for (String path : allowedPaths) plain.add(new Result(path, pmcidOf(path), 1.0));
+            return plain.subList(0, Math.min(topK, plain.size()));
+        }
+
+        List<Result> scored = "bm25".equalsIgnoreCase(model)
+            ? searchBM25(positiveStems, totalDocs)
+            : searchVSM(positiveStems, totalDocs);
+
+        List<Result> filtered = scored.stream()
+            .filter(r -> allowedPaths.contains(r.path))
+            .collect(Collectors.toList());
+
+        return filtered.subList(0, Math.min(topK, filtered.size()));
+    }
+
+    static Map<String, Double> docVector(String path) {
+        Map<String, Double> vec = new HashMap<>();
+        try {
+            NXMLFileReader reader = new NXMLFileReader(new File(path));
+            String text = (reader.getTitle() != null ? reader.getTitle() : "")
+                        + " " + (reader.getAbstr() != null ? reader.getAbstr() : "");
+            for (String stem : processQuery(text)) vec.merge(stem, 1.0, Double::sum);
+        } catch (Exception ignored) {}
+        return vec;
+    }
+
+    static double cosine(Map<String, Double> a, Map<String, Double> b) {
+        if (a == null || b == null || a.isEmpty() || b.isEmpty()) return 0;
+        Map<String, Double> small = a.size() < b.size() ? a : b;
+        Map<String, Double> large = small == a ? b : a;
+        double dot = 0;
+        for (Map.Entry<String, Double> e : small.entrySet()) {
+            Double v = large.get(e.getKey());
+            if (v != null) dot += e.getValue() * v;
+        }
+        double na = 0, nb = 0;
+        for (double v : a.values()) na += v * v;
+        for (double v : b.values()) nb += v * v;
+        return (na == 0 || nb == 0) ? 0 : dot / (Math.sqrt(na) * Math.sqrt(nb));
+    }
+
+    static List<Result> diversifyMMR(List<Result> ranked, double lambda, int topK) {
+        if (ranked.size() <= 1) return new ArrayList<>(ranked.subList(0, Math.min(topK, ranked.size())));
+
+        int pool = Math.min(ranked.size(), 30);
+        List<Result> candidates = new ArrayList<>(ranked.subList(0, pool));
+
+        Map<String, Map<String, Double>> vectors = new HashMap<>();
+        for (Result r : candidates) vectors.put(r.pmcid, docVector(r.path));
+
+        double maxScore = candidates.get(0).score;
+        if (maxScore <= 0) maxScore = 1;
+
+        List<Result> selected  = new ArrayList<>();
+        List<Result> remaining = new ArrayList<>(candidates);
+        while (!remaining.isEmpty() && selected.size() < topK) {
+            Result best = null;
+            double bestMMR = -Double.MAX_VALUE;
+            for (Result r : remaining) {
+                double rel    = r.score / maxScore;
+                double maxSim = 0;
+                for (Result s : selected)
+                    maxSim = Math.max(maxSim, cosine(vectors.get(r.pmcid), vectors.get(s.pmcid)));
+                double mmr = lambda * rel - (1 - lambda) * maxSim;
+                if (mmr > bestMMR) { bestMMR = mmr; best = r; }
+            }
+            selected.add(best);
+            remaining.remove(best);
+        }
+        return selected;
+    }
+
     static void interactiveMode() throws Exception {
         BufferedReader br  = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
         String         sep = "-".repeat(56);
 
-        System.out.println("\nMedIR  [" + MODEL.toUpperCase() + "]");
+        System.out.println("\nMedIR v" + VERSION + "  [" + MODEL.toUpperCase() + "]");
         System.out.println("Phrase queries: use quotes, e.g.  \"chest pain\"");
-        System.out.println("Query expansion: prefix with +,  e.g.  +myocardial");
+        System.out.println("Boolean / wildcard: heart AND (failure OR attack) NOT chronic,  cardi*");
+        System.out.println("Proximity: \"chest pain\"~5    Query expansion: prefix with +");
+        System.out.println("Models (--model): bm25 | vsm | semantic | hybrid (BM25+LSA via RRF)");
         System.out.println("'exit' to quit, prefix ':' for snippet\n");
 
         while (true) {
@@ -642,6 +882,21 @@ public class QueryEvaluator {
             if (doExpand) input = input.substring(1).trim();
 
             long t0 = System.currentTimeMillis();
+
+            if (!doExpand && QueryParser.isAdvanced(input)) {
+                int fetchK = (TYPE_FILTER != null && !"all".equalsIgnoreCase(TYPE_FILTER)) ? TOP_K * 20 : TOP_K;
+                QueryParser.Parsed parsed = new QueryParser().search(input, MODEL, fetchK);
+                List<Result> results = filterByType(parsed.results, TYPE_FILTER, TOP_K);
+                long elapsed = System.currentTimeMillis() - t0;
+                System.out.println("  [advanced: " + parsed.mode + "]\n");
+                for (int i = 0; i < results.size(); i++) {
+                    Result r = results.get(i);
+                    System.out.printf("  %2d.  %-22s  %.5f%n", i + 1, r.pmcid, r.score);
+                    if (showSnip) System.out.println("        " + getSnippet(r.path, parsed.stems) + "\n");
+                }
+                System.out.printf("%n  %d result(s) in %dms%n%s%n%n", results.size(), elapsed, sep);
+                continue;
+            }
 
             List<List<String>> phrases = new ArrayList<>();
             List<String>       stems   = extractPhrases(input, phrases);
@@ -688,7 +943,7 @@ public class QueryEvaluator {
                                           String model,
                                           int topK) throws IOException {
         if (phrases.isEmpty())
-            return "bm25".equalsIgnoreCase(model) ? searchBM25(stems, topK) : searchVSM(stems, topK);
+            return searchByModel(stems, topK, model);
 
         Set<String> phraseMatchPmcids = null;
         for (List<String> phrase : phrases) {
@@ -705,9 +960,7 @@ public class QueryEvaluator {
             return phraseResults.subList(0, Math.min(topK, phraseResults.size()));
         }
 
-        List<Result> base = "bm25".equalsIgnoreCase(model)
-            ? searchBM25(stems, topK * 5)
-            : searchVSM(stems, topK * 5);
+        List<Result> base = searchByModel(stems, topK * 5, model);
 
         final Set<String> matchSet = phraseMatchPmcids != null ? phraseMatchPmcids : Collections.emptySet();
         List<Result> filtered = base.stream()

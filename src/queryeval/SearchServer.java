@@ -13,11 +13,13 @@ import java.util.stream.*;
 public class SearchServer {
 
     static final int PORT = 8080;
+    static String BASE = ".";
 
     public static void main(String[] args) throws Exception {
         mitos.stemmer.Stemmer.Initialize();
 
         String base = QueryEvaluator.resolveBaseDir();
+        BASE = base;
         QueryEvaluator.INDEX_DIR    = base + File.separator + "CollectionIndex";
         QueryEvaluator.STOPWORDS_EN = base + File.separator + "Stopwords" + File.separator + "stopwordsEn.txt";
         QueryEvaluator.STOPWORDS_GR = base + File.separator + "Stopwords" + File.separator + "stopwordsGr.txt";
@@ -26,19 +28,95 @@ public class SearchServer {
         QueryEvaluator.loadStopwords(QueryEvaluator.STOPWORDS_GR);
         QueryEvaluator.loadVocabulary();
         QueryEvaluator.countDocuments();
+        QueryEvaluator.ensureSemantic();
 
         System.out.println("Index loaded: " + QueryEvaluator.vocabulary.size()
-                + " terms | " + QueryEvaluator.totalDocs + " docs");
+                + " terms | " + QueryEvaluator.totalDocs + " docs"
+                + " | semantic: " + (QueryEvaluator.semantic != null
+                    ? "k=" + QueryEvaluator.semantic.k : "off"));
 
         HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
-        server.createContext("/search",  SearchServer::handleSearch);
-        server.createContext("/suggest", SearchServer::handleSuggest);
-        server.createContext("/similar", SearchServer::handleSimilar);
-        server.createContext("/stats",   SearchServer::handleStats);
-        server.createContext("/",        SearchServer::handleUI);
+        server.createContext("/search",      SearchServer::handleSearch);
+        server.createContext("/suggest",     SearchServer::handleSuggest);
+        server.createContext("/similar",     SearchServer::handleSimilar);
+        server.createContext("/stats",       SearchServer::handleStats);
+        server.createContext("/map",         SearchServer::handleMap);
+        server.createContext("/health",      SearchServer::handleHealth);
+        server.createContext("/openapi.yaml", SearchServer::handleOpenApi);
+        server.createContext("/",            SearchServer::handleUI);
         server.start();
 
         System.out.println("MedIR running at http://localhost:" + PORT);
+    }
+
+    // -------------------------------------------------------------------------
+    // /health
+    // -------------------------------------------------------------------------
+
+    static void handleHealth(HttpExchange ex) throws IOException {
+        cors(ex);
+        ex.getResponseHeaders().add("Content-Type", "application/json; charset=UTF-8");
+        boolean sem = QueryEvaluator.semantic != null;
+        String body = "{\"status\":\"ok\",\"terms\":" + QueryEvaluator.vocabulary.size()
+                + ",\"docs\":" + QueryEvaluator.totalDocs
+                + ",\"semantic\":" + sem
+                + ",\"latent_dims\":" + (sem ? QueryEvaluator.semantic.k : 0)
+                + ",\"models\":[\"bm25\",\"vsm\",\"semantic\",\"hybrid\"]}";
+        respond(ex, 200, body);
+    }
+
+    // -------------------------------------------------------------------------
+    // /openapi.yaml
+    // -------------------------------------------------------------------------
+
+    static void handleOpenApi(HttpExchange ex) throws IOException {
+        cors(ex);
+        File f = new File(BASE + File.separator + "openapi.yaml");
+        if (!f.exists()) { respond(ex, 404, "openapi.yaml not found"); return; }
+        byte[] bytes = java.nio.file.Files.readAllBytes(f.toPath());
+        ex.getResponseHeaders().add("Content-Type", "application/yaml; charset=UTF-8");
+        ex.sendResponseHeaders(200, bytes.length);
+        try (OutputStream os = ex.getResponseBody()) { os.write(bytes); }
+    }
+
+    // -------------------------------------------------------------------------
+    // /map?clusters=N  -- 2D latent projection + k-means clusters
+    // -------------------------------------------------------------------------
+
+    static void handleMap(HttpExchange ex) throws IOException {
+        cors(ex);
+        ex.getResponseHeaders().add("Content-Type", "application/json; charset=UTF-8");
+        QueryEvaluator.ensureSemantic();
+        SemanticModel m = QueryEvaluator.semantic;
+        if (m == null) { respond(ex, 200, "{\"docs\":[],\"clusters\":[]}"); return; }
+
+        Map<String, String> params = parseQuery(ex.getRequestURI().getQuery());
+        int nc = 4;
+        try { nc = Math.max(2, Math.min(8, Integer.parseInt(params.get("clusters")))); } catch (Exception ignored) {}
+
+        double[][] pts     = m.map2D();
+        int[]      assign  = m.kmeans(nc, 30);
+        List<List<String>> kws = m.clusterKeywords(assign, nc, 4);
+
+        StringBuilder sb = new StringBuilder("{\"docs\":[");
+        for (int i = 0; i < pts.length; i++) {
+            if (i > 0) sb.append(",");
+            int docNum = m.docNumByRow[i];
+            String path = QueryEvaluator.docPathById.get(docNum);
+            String type = detectType(path);
+            sb.append("{\"pmcid\":\"").append(je(m.pmcidByRow[i])).append("\"")
+              .append(",\"x\":").append(String.format("%.4f", pts[i][0]))
+              .append(",\"y\":").append(String.format("%.4f", pts[i][1]))
+              .append(",\"type\":\"").append(je(type)).append("\"")
+              .append(",\"cluster\":").append(assign[i]).append("}");
+        }
+        sb.append("],\"clusters\":[");
+        for (int c = 0; c < kws.size(); c++) {
+            if (c > 0) sb.append(",");
+            sb.append("{\"id\":").append(c).append(",\"keywords\":").append(toArr(kws.get(c))).append("}");
+        }
+        sb.append("]}");
+        respond(ex, 200, sb.toString());
     }
 
     // -------------------------------------------------------------------------
@@ -293,6 +371,8 @@ public class SearchServer {
             + "  font-weight:600;text-transform:uppercase;letter-spacing:.3px}"
             + ".badge-bm25{background:var(--blue-light);color:var(--blue)}"
             + ".badge-vsm{background:var(--red-light);color:var(--red)}"
+            + ".badge-semantic{background:#ede7ff;color:#6d28d9}"
+            + ".badge-hybrid{background:#e6fbf2;color:#0a8f5b}"
             + ".badge-diagnosis{background:#f0f4ff;color:#3d5af1}"
             + ".badge-test{background:#f5f0ff;color:#7c3aed}"
             + ".badge-treatment{background:var(--green-light);color:var(--green)}"
@@ -337,6 +417,22 @@ public class SearchServer {
             // No-results
             + ".empty{text-align:center;padding:40px 20px;color:var(--muted)}"
             + ".empty svg{width:48px;opacity:.25;margin-bottom:12px}"
+            // Document map
+            + ".map-wrap{max-width:860px;margin:0 auto 40px;padding:0 16px}"
+            + ".map-card{background:var(--card);border-radius:12px;padding:18px 20px;"
+            + "  box-shadow:0 2px 10px rgba(0,0,0,.09)}"
+            + ".map-card h3{font-size:.95em;font-weight:700;margin-bottom:4px}"
+            + ".map-card .sub{font-size:.8em;color:var(--muted);margin-bottom:12px}"
+            + ".map-svg{width:100%;height:380px;background:#fafbfc;border:1px solid var(--border);border-radius:8px}"
+            + ".map-dot{cursor:pointer;transition:.1s}"
+            + ".map-dot:hover{stroke:#1f2328;stroke-width:2px}"
+            + ".map-legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:12px}"
+            + ".leg-item{font-size:.8em;display:flex;align-items:center;gap:6px;color:var(--text)}"
+            + ".leg-swatch{width:12px;height:12px;border-radius:3px;flex-shrink:0}"
+            + ".leg-kw{color:var(--muted)}"
+            + ".map-tip{position:fixed;background:#1f2328;color:#fff;padding:5px 9px;border-radius:5px;"
+            + "  font-size:.78em;pointer-events:none;z-index:300;display:none;white-space:nowrap}"
+            + ".map-controls{display:flex;gap:8px;align-items:center;margin-bottom:10px;font-size:.83em;color:var(--muted)}"
             + "</style>"
             + "</head><body>"
             // Header
@@ -361,8 +457,10 @@ public class SearchServer {
             + "<option value='treatment'>Treatment</option>"
             + "</select>"
             + "<select id='model'>"
+            + "<option value='hybrid'>Hybrid (BM25+LSA)</option>"
             + "<option value='bm25'>BM25</option>"
             + "<option value='vsm'>VSM</option>"
+            + "<option value='semantic'>Semantic (LSA)</option>"
             + "</select>"
             + "<select id='topk'>"
             + "<option value='10'>Top 10</option>"
@@ -390,6 +488,22 @@ public class SearchServer {
             + "</div>"
             + "</div>"
             + "</div>"
+            // Document map
+            + "<div class='map-wrap'><div class='map-card'>"
+            + "<h3>Document Map &mdash; Latent Semantic Space</h3>"
+            + "<p class='sub'>Each point is an article projected onto the top-2 LSA dimensions (truncated SVD). "
+            + "Colours are unsupervised k-means clusters; hover for the PMC id.</p>"
+            + "<div class='map-controls'>"
+            + "<label>Clusters:</label>"
+            + "<select id='nclusters' onchange='loadMap()'>"
+            + "<option value='3'>3</option><option value='4' selected>4</option>"
+            + "<option value='5'>5</option><option value='6'>6</option></select>"
+            + "<span id='map-status'></span>"
+            + "</div>"
+            + "<svg class='map-svg' id='mapsvg' viewBox='0 0 820 380' preserveAspectRatio='xMidYMid meet'></svg>"
+            + "<div class='map-legend' id='map-legend'></div>"
+            + "</div></div>"
+            + "<div class='map-tip' id='maptip'></div>"
             // Modal
             + "<div class='modal-backdrop' id='modal' onclick='closeModal(event)'>"
             + "<div class='modal'>"
@@ -587,6 +701,38 @@ public class SearchServer {
             + "  a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);"
             + "  a.download='medIR_results.csv';a.click();"
             + "}"
+            // Document map (LSA latent space + k-means)
+            + "const MAPC=['#1a5fa8','#c5221f','#1e8c45','#7c3aed','#d97706','#0891b2','#db2777','#65a30d'];"
+            + "function loadMap(){"
+            + "  const nc=document.getElementById('nclusters').value;"
+            + "  document.getElementById('map-status').textContent='loading...';"
+            + "  fetch('/map?clusters='+nc).then(r=>r.json()).then(d=>{"
+            + "    const svg=document.getElementById('mapsvg');"
+            + "    if(!d.docs||!d.docs.length){svg.innerHTML='';document.getElementById('map-status').textContent='no embeddings (run indexer)';return;}"
+            + "    const W=820,H=380,pad=30;"
+            + "    const sx=v=>pad+(v+1)/2*(W-2*pad);"
+            + "    const sy=v=>H-pad-(v+1)/2*(H-2*pad);"
+            + "    let s=`<line x1='${pad}' y1='${H/2}' x2='${W-pad}' y2='${H/2}' stroke='#e9ecf1'/>`"
+            + "      +`<line x1='${W/2}' y1='${pad}' x2='${W/2}' y2='${H-pad}' stroke='#e9ecf1'/>`;"
+            + "    d.docs.forEach(p=>{"
+            + "      const c=MAPC[p.cluster%MAPC.length];"
+            + "      s+=`<circle class='map-dot' cx='${sx(p.x).toFixed(1)}' cy='${sy(p.y).toFixed(1)}' r='7' fill='${c}' fill-opacity='0.78' data-p='${p.pmcid}' data-t='${p.type}' data-c='${p.cluster}' onmousemove='mapTip(event)' onmouseout='hideTip()' onclick='showSimilar(\"${p.pmcid}\")'/>`;"
+            + "    });"
+            + "    svg.innerHTML=s;"
+            + "    document.getElementById('map-legend').innerHTML=d.clusters.map(c=>{"
+            + "      const col=MAPC[c.id%MAPC.length];"
+            + "      return `<div class='leg-item'><span class='leg-swatch' style='background:${col}'></span><b>C${c.id}</b> <span class='leg-kw'>${esc((c.keywords||[]).slice(0,3).join(', '))}</span></div>`;"
+            + "    }).join('');"
+            + "    document.getElementById('map-status').textContent=d.docs.length+' documents';"
+            + "  }).catch(()=>{document.getElementById('map-status').textContent='error';});"
+            + "}"
+            + "function mapTip(e){"
+            + "  const t=document.getElementById('maptip'),el=e.target;"
+            + "  t.innerHTML='PMC'+el.getAttribute('data-p')+(el.getAttribute('data-t')?' &middot; '+el.getAttribute('data-t'):'')+' &middot; C'+el.getAttribute('data-c');"
+            + "  t.style.display='block';t.style.left=(e.clientX+12)+'px';t.style.top=(e.clientY+12)+'px';"
+            + "}"
+            + "function hideTip(){document.getElementById('maptip').style.display='none';}"
+            + "loadMap();"
             // Utility
             + "function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}"
             + "</script>"

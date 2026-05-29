@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Compile
+        run: |
+          javac -encoding UTF-8 \
+            -cp "src/libs/BioReader.jar:src/libs/Stemmer.jar" \
+            -d out \
+            src/indexer/Indexer.java src/queryeval/*.java
+
+      - name: Unit tests
+        run: java -cp "out:src/libs/BioReader.jar:src/libs/Stemmer.jar" queryeval.TestRunner
+
+      - name: Build index + LSA embeddings
+        run: java -cp "out:src/libs/BioReader.jar:src/libs/Stemmer.jar" indexer.Indexer
+
+      - name: Evaluate retrieval quality (BM25 / VSM / LSA / Hybrid)
+        run: java -cp "out:src/libs/BioReader.jar:src/libs/Stemmer.jar" queryeval.IRQualityEvaluator --model all
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t medir:ci .
