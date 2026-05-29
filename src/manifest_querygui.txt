@@ -1,0 +1,2 @@
+Main-Class: queryeval.QueryEvaluatorGUI
+Class-Path: ../src/libs/BioReader.jar ../src/libs/Stemmer.jar

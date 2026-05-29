@@ -1,0 +1,3 @@
+Main-Class: queryeval.IRQualityEvaluator
+Class-Path: ../src/libs/BioReader.jar ../src/libs/Stemmer.jar
+
