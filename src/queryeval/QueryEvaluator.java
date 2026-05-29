@@ -32,14 +32,8 @@ public class QueryEvaluator {
 
     static final double BM25_K1 = 1.5;
     static final double BM25_B  = 0.75;
-
-    // Rocchio pseudo-relevance feedback parameters
-    static final int ROCCHIO_FEEDBACK_DOCS  = 3;
-    static final int ROCCHIO_EXPAND_TERMS   = 5;
-
-    // -------------------------------------------------------------------------
-    // Inner classes
-    // -------------------------------------------------------------------------
+    static final int ROCCHIO_FEEDBACK_DOCS = 3;
+    static final int ROCCHIO_EXPAND_TERMS  = 5;
 
     static class VocabEntry {
         final String stem;
@@ -60,7 +54,6 @@ public class QueryEvaluator {
         @Override public int compareTo(Result o) { return Double.compare(o.score, this.score); }
     }
 
-    // Holds positional postings for one stem+doc
     static class DocPositions {
         final long          docOffset;
         final List<Integer> positions;
@@ -68,10 +61,6 @@ public class QueryEvaluator {
             this.docOffset = offset; this.positions = positions;
         }
     }
-
-    // -------------------------------------------------------------------------
-    // Bootstrap
-    // -------------------------------------------------------------------------
 
     static String resolveBaseDir() {
         Path cwd = Paths.get("").toAbsolutePath();
@@ -122,10 +111,6 @@ public class QueryEvaluator {
         else                       interactiveMode();
     }
 
-    // -------------------------------------------------------------------------
-    // Index loading
-    // -------------------------------------------------------------------------
-
     static void loadStopwords(String path) throws IOException {
         File f = new File(path);
         if (!f.exists()) return;
@@ -172,11 +157,6 @@ public class QueryEvaluator {
         if (totalDocs > 0) avgDocLen /= totalDocs;
     }
 
-    // -------------------------------------------------------------------------
-    // Query processing
-    // -------------------------------------------------------------------------
-
-    // Stem a plain text string into a list of stems (no phrase detection)
     static List<String> processQuery(String text) {
         String[] tokens = text.toLowerCase()
                               .replaceAll("[^\\p{L}\\p{Nd} ]+", " ")
@@ -190,9 +170,6 @@ public class QueryEvaluator {
         return result;
     }
 
-    // Parse quoted phrases out of raw query text.
-    // Returns the bag-of-words stems from the non-quoted portion;
-    // populated 'phrases' list receives each phrase as a stem sequence.
     static List<String> extractPhrases(String text, List<List<String>> phrases) {
         Matcher m = Pattern.compile("\"([^\"]+)\"").matcher(text);
         StringBuffer sb = new StringBuffer();
@@ -204,10 +181,6 @@ public class QueryEvaluator {
         m.appendTail(sb);
         return processQuery(sb.toString());
     }
-
-    // -------------------------------------------------------------------------
-    // Spelling / OOV
-    // -------------------------------------------------------------------------
 
     static int editDistance(String a, String b) {
         int la = a.length(), lb = b.length();
@@ -241,7 +214,6 @@ public class QueryEvaluator {
         return suggestions;
     }
 
-    // Returns OOV stems -> nearest suggestions (for "did you mean?" display)
     static Map<String, List<String>> getOovInfo(List<String> stems) {
         Map<String, List<String>> oov = new LinkedHashMap<>();
         for (String stem : stems) {
@@ -252,10 +224,6 @@ public class QueryEvaluator {
         }
         return oov;
     }
-
-    // -------------------------------------------------------------------------
-    // VSM search
-    // -------------------------------------------------------------------------
 
     static List<Result> searchVSM(List<String> queryStems, int topK) throws IOException {
         if (queryStems.isEmpty()) return Collections.emptyList();
@@ -325,10 +293,6 @@ public class QueryEvaluator {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // BM25 search
-    // -------------------------------------------------------------------------
-
     static List<Result> searchBM25(List<String> queryStems, int topK) throws IOException {
         if (queryStems.isEmpty()) return Collections.emptyList();
 
@@ -395,18 +359,12 @@ public class QueryEvaluator {
         }
     }
 
-    // Dispatcher
     static List<Result> search(List<String> queryStems, int topK) throws IOException {
         return "bm25".equalsIgnoreCase(MODEL)
             ? searchBM25(queryStems, topK)
             : searchVSM(queryStems, topK);
     }
 
-    // -------------------------------------------------------------------------
-    // Phrase search (positional index)
-    // -------------------------------------------------------------------------
-
-    // Loads complete positional postings for all words that stem to 'stem'
     static Map<Integer, DocPositions> loadStemPostings(String stem) throws IOException {
         Map<Integer, DocPositions> result = new HashMap<>();
         List<String> words = stemToWords.getOrDefault(stem, Collections.emptyList());
@@ -439,7 +397,6 @@ public class QueryEvaluator {
         return result;
     }
 
-    // Exact phrase search: documents where phraseStems appear consecutively
     static List<Result> searchPhrase(List<String> phraseStems, int topK) throws IOException {
         if (phraseStems.isEmpty()) return Collections.emptyList();
         if (phraseStems.size() == 1) return search(phraseStems, topK);
@@ -447,7 +404,6 @@ public class QueryEvaluator {
         List<Map<Integer, DocPositions>> allPostings = new ArrayList<>();
         for (String stem : phraseStems) allPostings.add(loadStemPostings(stem));
 
-        // Candidate docs must contain every term
         Set<Integer> candidates = new HashSet<>(allPostings.get(0).keySet());
         for (int i = 1; i < allPostings.size(); i++) candidates.retainAll(allPostings.get(i).keySet());
 
@@ -484,11 +440,6 @@ public class QueryEvaluator {
         return results.subList(0, Math.min(topK, results.size()));
     }
 
-    // -------------------------------------------------------------------------
-    // Rocchio pseudo-relevance feedback
-    // -------------------------------------------------------------------------
-
-    // Expands queryStems with high-scoring terms from the top feedback documents
     static List<String> expandQueryRocchio(List<String> originalStems,
                                            int feedbackDocs, int expandTerms) {
         try {
@@ -533,11 +484,6 @@ public class QueryEvaluator {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Snippet + highlighting
-    // -------------------------------------------------------------------------
-
-    // Plain-text snippet (used by CLI)
     static String getSnippet(String docPath, List<String> queryStems) {
         try {
             NXMLFileReader reader = new NXMLFileReader(new File(docPath));
@@ -562,7 +508,6 @@ public class QueryEvaluator {
         return "(no snippet)";
     }
 
-    // HTML snippet with <mark> highlighting around matched terms
     static String getHighlightedSnippet(String docPath, List<String> queryStems) {
         try {
             NXMLFileReader reader = new NXMLFileReader(new File(docPath));
@@ -601,11 +546,6 @@ public class QueryEvaluator {
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
     }
 
-    // -------------------------------------------------------------------------
-    // Autocomplete
-    // -------------------------------------------------------------------------
-
-    // Vocabulary terms starting with prefix, sorted by document frequency desc
     static List<String> getAutocompleteSuggestions(String prefix, int topK) {
         if (prefix == null || prefix.length() < 2) return Collections.emptyList();
         String p = prefix.toLowerCase();
@@ -617,11 +557,6 @@ public class QueryEvaluator {
             .collect(Collectors.toList());
     }
 
-    // -------------------------------------------------------------------------
-    // Document similarity
-    // -------------------------------------------------------------------------
-
-    // Finds documents similar to a given PMCID using its title+abstract as a query
     static List<Result> getSimilarDocs(String pmcid, int topK) throws IOException {
         String docPath = null;
         try (BufferedReader br = new BufferedReader(new InputStreamReader(
@@ -647,7 +582,6 @@ public class QueryEvaluator {
             Map<String, Long> tf  = allStems.stream()
                 .collect(Collectors.groupingBy(s -> s, Collectors.counting()));
 
-            // Keep terms that are informative (not too rare, not ubiquitous)
             List<String> topStems = tf.entrySet().stream()
                 .filter(e -> {
                     List<String> ws = stemToWords.getOrDefault(e.getKey(), Collections.emptyList());
@@ -669,10 +603,6 @@ public class QueryEvaluator {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Filtering
-    // -------------------------------------------------------------------------
-
     static List<Result> filterByType(List<Result> results, String type, int topK) {
         if (type == null || "all".equalsIgnoreCase(type))
             return results.subList(0, Math.min(topK, results.size()));
@@ -688,10 +618,6 @@ public class QueryEvaluator {
         }
         return filtered;
     }
-
-    // -------------------------------------------------------------------------
-    // Interactive CLI
-    // -------------------------------------------------------------------------
 
     static void interactiveMode() throws Exception {
         BufferedReader br  = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
@@ -712,13 +638,11 @@ public class QueryEvaluator {
             boolean showSnip = SHOW_SNIPPET || input.startsWith(":");
             if (input.startsWith(":")) input = input.substring(1).trim();
 
-            // Optional query expansion flag
             boolean doExpand = input.startsWith("+");
             if (doExpand) input = input.substring(1).trim();
 
             long t0 = System.currentTimeMillis();
 
-            // Parse phrases
             List<List<String>> phrases = new ArrayList<>();
             List<String>       stems   = extractPhrases(input, phrases);
 
@@ -727,14 +651,12 @@ public class QueryEvaluator {
                 continue;
             }
 
-            // OOV info
             Map<String, List<String>> oov = getOovInfo(stems);
             if (!oov.isEmpty()) {
                 for (Map.Entry<String, List<String>> e : oov.entrySet())
                     System.out.println("  [OOV] \"" + e.getKey() + "\" -> suggestions: " + e.getValue());
             }
 
-            // Rocchio expansion
             List<String> expandedTerms = Collections.emptyList();
             if (doExpand && !stems.isEmpty()) {
                 List<String> expanded = expandQueryRocchio(stems, ROCCHIO_FEEDBACK_DOCS, ROCCHIO_EXPAND_TERMS);
@@ -761,16 +683,13 @@ public class QueryEvaluator {
         System.out.println("Bye.");
     }
 
-    // Combined bag-of-words + phrase search
     static List<Result> runCombinedSearch(List<String> stems,
                                           List<List<String>> phrases,
                                           String model,
                                           int topK) throws IOException {
-        if (phrases.isEmpty()) {
+        if (phrases.isEmpty())
             return "bm25".equalsIgnoreCase(model) ? searchBM25(stems, topK) : searchVSM(stems, topK);
-        }
 
-        // Gather docs satisfying all phrase constraints
         Set<String> phraseMatchPmcids = null;
         for (List<String> phrase : phrases) {
             List<Result> pm = searchPhrase(phrase, totalDocs);
@@ -780,14 +699,12 @@ public class QueryEvaluator {
         }
 
         if (stems.isEmpty()) {
-            // Pure phrase query: score by phrase occurrence count
             List<Result> phraseResults = new ArrayList<>();
             for (List<String> phrase : phrases) phraseResults.addAll(searchPhrase(phrase, topK));
             phraseResults.sort(null);
             return phraseResults.subList(0, Math.min(topK, phraseResults.size()));
         }
 
-        // Mixed: rank by model score, filtered by phrase constraint
         List<Result> base = "bm25".equalsIgnoreCase(model)
             ? searchBM25(stems, topK * 5)
             : searchVSM(stems, topK * 5);
@@ -797,13 +714,8 @@ public class QueryEvaluator {
             .filter(r -> matchSet.contains(r.pmcid))
             .collect(Collectors.toList());
 
-        // If phrase constraint eliminates everything, fall back to plain bag-of-words
         return filtered.isEmpty() ? base : filtered;
     }
-
-    // -------------------------------------------------------------------------
-    // Topics batch mode
-    // -------------------------------------------------------------------------
 
     static void processTopics(String topicsFile, String useField) throws Exception {
         ArrayList<Topic> topics = TopicsReader.readTopics(topicsFile);

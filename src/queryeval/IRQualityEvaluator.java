@@ -86,7 +86,6 @@ public class IRQualityEvaluator {
         String resultsOut = docDir + File.separator + "results.txt";
         String qrelsOut   = docDir + File.separator + "qrels.txt";
 
-        // initialize QueryEvaluator
         QueryEvaluator.INDEX_DIR    = indexDir;
         QueryEvaluator.STOPWORDS_EN = swEn;
         QueryEvaluator.STOPWORDS_GR = swGr;
@@ -99,14 +98,11 @@ public class IRQualityEvaluator {
 
         ArrayList<Topic> allTopics = TopicsReader.readTopics(topicsFile);
 
-        // Build qrels from the MiniCollection directory structure
         Map<Integer, Map<String, Integer>> qrels = buildQrelsFromDir(datasetDir);
         System.out.println("Ground truth for " + qrels.size() + " topics");
 
-        // Write qrels.txt 
         writeQrelsTrec(qrelsOut, qrels);
 
-        // Only evaluate topics that have ground truth
         List<Topic> evalTopics = new ArrayList<>();
         for (Topic t : allTopics) {
             if (qrels.containsKey(t.getNumber())) evalTopics.add(t);
@@ -217,8 +213,7 @@ public class IRQualityEvaluator {
             String pmcid = results.get(i).pmcid;
             int    rel   = qrels.getOrDefault(pmcid, 0);
 
-            // Graded DCG: gain = rel * log2 / log(rank+1)
-            double gain = rel * Math.log(2) / Math.log(rank + 1);
+                double gain = rel * Math.log(2) / Math.log(rank + 1);
             if (rank <= 5)  dcg5  += gain;
             if (rank <= 10) dcg10 += gain;
 
@@ -233,7 +228,6 @@ public class IRQualityEvaluator {
 
         m.numRelRet = numRelRet;
 
-        // P@K divides by K (non-retrieved docs count as non-relevant)
         m.p5  = relAt5  / 5.0;
         m.p10 = relAt10 / 10.0;
         m.r5  = numRel > 0 ? relAt5  / (double) numRel : 0;
@@ -247,7 +241,6 @@ public class IRQualityEvaluator {
         m.ndcg5  = idcg5  > 0 ? dcg5  / idcg5  : 0;
         m.ndcg10 = idcg10 > 0 ? dcg10 / idcg10 : 0;
 
-        // R-Prec: precision at rank R (R = numRel)
         if (numRel > 0) {
             int bound = Math.min(numRel, results.size());
             int relAtR = 0;
@@ -263,7 +256,6 @@ public class IRQualityEvaluator {
         return (p + r > 0) ? 2 * p * r / (p + r) : 0;
     }
 
-    // Ideal DCG: sort grades descending, sum top-k gains
     static double computeIDCG(Map<String, Integer> qrels, int k) {
         List<Integer> grades = new ArrayList<>(qrels.values());
         grades.sort(Collections.reverseOrder());
