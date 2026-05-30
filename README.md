@@ -261,4 +261,4 @@ Dockerfile / docker-compose.yml
 
 ---
 
-*University of Crete · CS-463 Information Retrieval · group 5241 / 5064 / 1497*
+
