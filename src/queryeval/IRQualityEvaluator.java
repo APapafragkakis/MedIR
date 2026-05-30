@@ -52,6 +52,7 @@ public class IRQualityEvaluator {
         String topicType;
         int    numRel, numRetrieved, numRelRet;
         double p5, p10, r5, r10, f5, f10, ap, ndcg5, ndcg10, rPrec;
+        double[] prCurve; // 11-point interpolated P/R (recall 0.0 .. 1.0)
     }
 
     public static void main(String[] args) throws Exception {
@@ -107,10 +108,21 @@ public class IRQualityEvaluator {
         }
         System.out.println("Evaluating " + evalTopics.size() + " topics\n");
 
+        boolean runAll = "all".equalsIgnoreCase(model);
         List<String> modelsToRun =
               "both".equalsIgnoreCase(model) ? Arrays.asList("vsm", "bm25")
-            : "all".equalsIgnoreCase(model)  ? Arrays.asList("vsm", "bm25", "semantic", "hybrid")
+            : runAll ? Arrays.asList("vsm", "bm25", "semantic", "hybrid", "ltr")
             : Collections.singletonList(model.toLowerCase());
+
+        // Train LTR when running all models — builds feature pool from qrels + all three rankers
+        if (runAll) {
+            System.out.println("Training LTR model (coordinate ascent)...");
+            Map<Integer, List<double[]>> ltrData = buildLTRData(evalTopics, qrels, useField);
+            double[] weights = LTRModel.train(ltrData, 5);
+            LTRModel.save(indexDir, weights);
+            QueryEvaluator.ltrWeights = weights;
+            QueryEvaluator.ltrTried = true;
+        }
 
         Map<String, List<TopicMetrics>> allModelMetrics = new LinkedHashMap<>();
         StringBuilder trecResults = new StringBuilder();
@@ -151,9 +163,12 @@ public class IRQualityEvaluator {
 
         writeFile(resultsOut, trecResults.toString());
         writeEvalTSV(evalOut, allModelMetrics.values().iterator().next());
+        String prCurveOut = docDir + File.separator + "prcurve.json";
+        writePRCurveJson(prCurveOut, allModelMetrics);
         System.out.println("results.txt      -> " + resultsOut);
         System.out.println("qrels.txt        -> " + qrelsOut);
         System.out.println("eval_results.txt -> " + evalOut);
+        System.out.println("prcurve.json     -> " + prCurveOut);
     }
 
     static Map<Integer, Map<String, Integer>> buildQrelsFromDir(String datasetDir) {
@@ -248,6 +263,27 @@ public class IRQualityEvaluator {
             m.rPrec = (double) relAtR / numRel;
         }
 
+        // 11-point interpolated P/R
+        int[] cumRel = new int[results.size()];
+        int cr = 0;
+        for (int i = 0; i < results.size(); i++) {
+            if (qrels.getOrDefault(results.get(i).pmcid, 0) >= 1) cr++;
+            cumRel[i] = cr;
+        }
+        m.prCurve = new double[11];
+        if (numRel > 0) {
+            for (int r = 0; r <= 10; r++) {
+                double thresh = r / 10.0;
+                double maxP = 0;
+                for (int i = 0; i < results.size(); i++) {
+                    double rec = (double) cumRel[i] / numRel;
+                    if (rec >= thresh - 1e-9)
+                        maxP = Math.max(maxP, (double) cumRel[i] / (i + 1));
+                }
+                m.prCurve[r] = maxP;
+            }
+        }
+
         return m;
     }
 
@@ -309,15 +345,31 @@ public class IRQualityEvaluator {
         System.out.println("==========================================");
         System.out.printf("  %-10s  %8s  %8s  %8s  %8s%n", "Model", "MAP", "P@10", "NDCG@10", "R-Prec");
         System.out.println("  ----------------------------------------");
-        for (Map.Entry<String, List<TopicMetrics>> e : modelMetrics.entrySet()) {
-            List<TopicMetrics> metrics = e.getValue();
+
+        List<String> names = new ArrayList<>(modelMetrics.keySet());
+        Map<String, double[]> apVecs = new LinkedHashMap<>();
+
+        for (String name : names) {
+            List<TopicMetrics> metrics = modelMetrics.get(name);
             int n = metrics.size();
             double map = metrics.stream().mapToDouble(m -> m.ap).sum() / n;
             double p10 = metrics.stream().mapToDouble(m -> m.p10).sum() / n;
             double ndcg = metrics.stream().mapToDouble(m -> m.ndcg10).sum() / n;
             double rp  = metrics.stream().mapToDouble(m -> m.rPrec).sum() / n;
             System.out.printf("  %-10s  %8.4f  %8.4f  %8.4f  %8.4f%n",
-                e.getKey().toUpperCase(), map, p10, ndcg, rp);
+                    name.toUpperCase(), map, p10, ndcg, rp);
+            double[] ap = metrics.stream().mapToDouble(m -> m.ap).toArray();
+            apVecs.put(name, ap);
+        }
+
+        System.out.println("\n  Statistical significance (Wilcoxon, per-topic AP, two-tailed):");
+        for (int i = 0; i < names.size(); i++) {
+            for (int j = i + 1; j < names.size(); j++) {
+                double p = wilcoxon(apVecs.get(names.get(i)), apVecs.get(names.get(j)));
+                String sig = p < 0.001 ? "***" : p < 0.01 ? "**" : p < 0.05 ? "*" : "ns";
+                System.out.printf("  %-8s vs %-8s  p = %.3f  %s%n",
+                        names.get(i).toUpperCase(), names.get(j).toUpperCase(), p, sig);
+            }
         }
         System.out.println("==========================================\n");
     }
@@ -332,6 +384,128 @@ public class IRQualityEvaluator {
                     pw.printf("%d\t0\t%s\t%d%n", topicId, d.getKey(), d.getValue());
             }
         }
+    }
+
+    // Wilcoxon signed-rank test (two-tailed) on per-topic AP arrays. Returns p-value.
+    static double wilcoxon(double[] a, double[] b) {
+        int n = a.length;
+        List<Double> diffs = new ArrayList<>();
+        for (int i = 0; i < n; i++) { double d = a[i] - b[i]; if (Math.abs(d) > 1e-10) diffs.add(d); }
+        int m = diffs.size();
+        if (m < 2) return 1.0;
+
+        Integer[] idx = new Integer[m];
+        for (int i = 0; i < m; i++) idx[i] = i;
+        Arrays.sort(idx, (x, y) -> Double.compare(Math.abs(diffs.get(x)), Math.abs(diffs.get(y))));
+
+        double[] rank = new double[m];
+        int i = 0;
+        while (i < m) {
+            int j = i;
+            while (j < m && Math.abs(diffs.get(idx[j])) == Math.abs(diffs.get(idx[i]))) j++;
+            double r = (i + j + 1) / 2.0;
+            for (int k = i; k < j; k++) rank[idx[k]] = r;
+            i = j;
+        }
+
+        double wPlus = 0, wMinus = 0;
+        for (int k = 0; k < m; k++) {
+            if (diffs.get(k) > 0) wPlus += rank[k]; else wMinus += rank[k];
+        }
+        double W = Math.min(wPlus, wMinus);
+        double mu    = m * (m + 1) / 4.0;
+        double sigma = Math.sqrt(m * (m + 1) * (2 * m + 1) / 24.0);
+        if (sigma == 0) return 1.0;
+        double z = Math.abs(W - mu) / sigma;
+        return 2.0 * (1.0 - normalCDF(z));
+    }
+
+    static double normalCDF(double z) {
+        double t = 1.0 / (1.0 + 0.2316419 * Math.abs(z));
+        double p = 1.0 - (1.0 / Math.sqrt(2 * Math.PI)) * Math.exp(-0.5 * z * z)
+                * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937
+                + t * (-1.821255978 + t * 1.330274429))));
+        return z >= 0 ? p : 1.0 - p;
+    }
+
+    // Build feature pool for LTR training.
+    // Each sample: [label, bm25_norm, vsm_norm, sem_cos, rr_bm25, rr_sem]
+    static Map<Integer, List<double[]>> buildLTRData(
+            List<Topic> topics, Map<Integer, Map<String, Integer>> qrels,
+            String useField) throws Exception {
+
+        Map<Integer, List<double[]>> data = new LinkedHashMap<>();
+        int pool = 50;
+
+        for (Topic topic : topics) {
+            int id = topic.getNumber();
+            String text = "description".equals(useField)
+                    ? topic.getDescription() : topic.getSummary();
+            List<String> stems = QueryEvaluator.processQuery(text);
+            if (stems.isEmpty()) continue;
+
+            List<QueryEvaluator.Result> bm = QueryEvaluator.searchBM25(stems, pool);
+            List<QueryEvaluator.Result> vs = QueryEvaluator.searchVSM(stems, pool);
+            List<QueryEvaluator.Result> sm = QueryEvaluator.searchSemantic(stems, pool);
+
+            double maxBm = bm.isEmpty() ? 1 : bm.get(0).score;
+            double maxVs = vs.isEmpty() ? 1 : vs.get(0).score;
+
+            // [label, bm25_n, vsm_n, sem, rr_bm, rr_sm]
+            Map<String, double[]> feats = new LinkedHashMap<>();
+            for (int j = 0; j < bm.size(); j++) {
+                QueryEvaluator.Result r = bm.get(j);
+                double[] f = feats.computeIfAbsent(r.pmcid, k -> new double[LTRModel.NFEAT + 1]);
+                f[1] = maxBm > 0 ? r.score / maxBm : 0;
+                f[4] = 1.0 / (j + 1);
+            }
+            for (int j = 0; j < vs.size(); j++) {
+                QueryEvaluator.Result r = vs.get(j);
+                double[] f = feats.computeIfAbsent(r.pmcid, k -> new double[LTRModel.NFEAT + 1]);
+                f[2] = maxVs > 0 ? r.score / maxVs : 0;
+            }
+            for (int j = 0; j < sm.size(); j++) {
+                QueryEvaluator.Result r = sm.get(j);
+                double[] f = feats.computeIfAbsent(r.pmcid, k -> new double[LTRModel.NFEAT + 1]);
+                f[3] = r.score;
+                f[5] = 1.0 / (j + 1);
+            }
+
+            Map<String, Integer> tq = qrels.getOrDefault(id, Collections.emptyMap());
+            for (Map.Entry<String, double[]> e : feats.entrySet())
+                e.getValue()[0] = tq.getOrDefault(e.getKey(), 0) >= 1 ? 1.0 : 0.0;
+
+            data.put(id, new ArrayList<>(feats.values()));
+        }
+        return data;
+    }
+
+    static void writePRCurveJson(String path, Map<String, List<TopicMetrics>> modelMetrics) throws IOException {
+        ensureParentDir(path);
+        StringBuilder sb = new StringBuilder("{\"recall_levels\":[");
+        for (int r = 0; r <= 10; r++) { if (r > 0) sb.append(","); sb.append(String.format("%.1f", r / 10.0)); }
+        sb.append("],\"curves\":{");
+        boolean firstModel = true;
+        for (Map.Entry<String, List<TopicMetrics>> e : modelMetrics.entrySet()) {
+            if (!firstModel) sb.append(",");
+            firstModel = false;
+            List<TopicMetrics> mets = e.getValue();
+            double[] avg = new double[11];
+            int cnt = 0;
+            for (TopicMetrics tm : mets) {
+                if (tm.prCurve == null) continue;
+                for (int r = 0; r <= 10; r++) avg[r] += tm.prCurve[r];
+                cnt++;
+            }
+            sb.append("\"").append(e.getKey()).append("\":[");
+            for (int r = 0; r <= 10; r++) {
+                if (r > 0) sb.append(",");
+                sb.append(String.format("%.4f", cnt > 0 ? avg[r] / cnt : 0));
+            }
+            sb.append("]");
+        }
+        sb.append("}}");
+        writeFile(path, sb.toString());
     }
 
     static void ensureParentDir(String filePath) {

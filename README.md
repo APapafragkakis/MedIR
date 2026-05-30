@@ -7,9 +7,9 @@
 ![Dependencies](https://img.shields.io/badge/runtime%20deps-none-success)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-MedIR is a full-stack information retrieval system for clinical medical literature. It builds a **positional inverted index** over a collection of PubMed Central articles and ranks them with **four retrieval models** — including a **Latent Semantic Analysis (LSA) engine implemented from scratch** (truncated SVD, no ML libraries) and a **hybrid lexical+semantic ranker** fused via Reciprocal Rank Fusion.
+MedIR is a full-stack information retrieval system for clinical medical literature. It builds a **positional inverted index** over a collection of PubMed Central articles and ranks them with **five retrieval models** — including a **Latent Semantic Analysis (LSA) engine implemented from scratch** (truncated SVD, no ML libraries), a **hybrid lexical+semantic ranker** fused via Reciprocal Rank Fusion, and a **Learning-to-Rank model** trained with coordinate ascent directly on MAP.
 
-Retrieval is exposed through four interfaces: an interactive **CLI**, a desktop **Swing GUI**, a **REST API with a browser search UI** (autocomplete, snippet highlighting, and an interactive latent-space document map), and a batch **TREC evaluation pipeline**. The whole system is containerized with a multi-stage **Docker** build, validated in **GitHub Actions CI**, and documented with an **OpenAPI 3.0** spec.
+Retrieval is exposed through four interfaces: an interactive **CLI**, a desktop **Swing GUI**, a **REST API with a browser search UI** (autocomplete, snippet highlighting, interactive latent-space document map, and **Precision–Recall curve visualization**), and a batch **TREC evaluation pipeline** with **Wilcoxon statistical significance testing**. The whole system is containerized with a multi-stage **Docker** build, validated in **GitHub Actions CI**, and documented with an **OpenAPI 3.0** spec.
 
 Built on the TREC Clinical Decision Support track dataset — three clinical query types: *diagnosis*, *test*, *treatment*.
 
@@ -18,9 +18,11 @@ Built on the TREC Clinical Decision Support track dataset — three clinical que
 ## Highlights
 
 - **LSA semantic search from scratch** — dense document embeddings from a truncated SVD (NIPALS power iteration with residual deflation), with correct query fold-in (`A·V = U·Σ`). No NumPy, no external linear-algebra library — pure Java.
+- **Learning to Rank** — coordinate ascent over 5 features (BM25 score, VSM score, LSA cosine, reciprocal rank from BM25, reciprocal rank from LSA) that directly maximises MAP. Trained on the collection's own qrels and saved to `LTRWeights.txt` for live serving.
 - **Hybrid retrieval** — combines BM25 (lexical) and LSA (semantic) rankings with **Reciprocal Rank Fusion** (RRF, k=60) for robustness across query types.
-- **Unsupervised document map** — spherical k-means clustering over the latent embeddings, projected to a 2D map and rendered as an interactive SVG scatter plot in the web UI.
-- **Four ranking models, head-to-head** — VSM, BM25, LSA, and Hybrid, all measured with a TREC-style evaluation harness (MAP, P@K, R@K, NDCG, R-Prec).
+- **Statistical significance** — **Wilcoxon signed-rank test** on per-topic AP for every model pair; the evaluation report flags `*` / `**` / `***` significance levels.
+- **Unsupervised document map** — spherical k-means clustering over the latent embeddings, projected to a 2D map and rendered as an interactive SVG scatter plot; **Precision–Recall curves** for all models live in the same UI.
+- **Five ranking models, head-to-head** — VSM, BM25, LSA, Hybrid, and LTR, all measured with a TREC-style evaluation harness (MAP, P@K, R@K, NDCG, R-Prec).
 - **Production-shaped delivery** — REST API, OpenAPI spec, multi-stage Docker image with a health check, GitHub Actions CI, and a dependency-free test suite (23 tests).
 - **Classic IR done right** — phrase / boolean / proximity / wildcard queries, Rocchio pseudo-relevance feedback, Levenshtein spelling correction, prefix autocomplete, and document-similarity search.
 
@@ -43,6 +45,7 @@ flowchart LR
     ANL --> SEM["Semantic (LSA cosine)"]
     BM25 --> RRF["Hybrid · RRF fusion"]
     SEM --> RRF
+    BM25 & VSM & SEM --> LTR["LTR · coordinate ascent"]
   end
 
   INV --> VSM
@@ -72,10 +75,11 @@ flowchart LR
 | **BM25** | Probabilistic relevance (k1 = 1.5, b = 0.75) with document-length normalization | Lexical baseline |
 | **Semantic (LSA)** | Cosine similarity in a dense latent space from truncated SVD | Captures synonymy / topical relevance the bag-of-words models miss |
 | **Hybrid** | Reciprocal Rank Fusion of BM25 + LSA (k = 60) | Robust blend of lexical precision and semantic recall |
+| **LTR** | Linear combination of 5 features (BM25, VSM, LSA cosine, reciprocal ranks) with weights learned by coordinate ascent on MAP | Supervised; trained from qrels via `--model all` |
 
 ### Evaluation results
 
-Measured on the MiniCollection (54 documents, 6 TREC topics), top-10, via `dist/evaluator.jar --model all`:
+Measured on the MiniCollection (54 documents, 6 TREC topics), top-10, via `dist/evaluator.jar --model all`. LTR is trained on the same collection (train = test, acceptable at this scale) to demonstrate the technique.
 
 | Model        | MAP        | P@10   | NDCG@10    | R-Prec     |
 |--------------|------------|--------|------------|------------|
@@ -83,8 +87,9 @@ Measured on the MiniCollection (54 documents, 6 TREC topics), top-10, via `dist/
 | BM25         | 0.5509     | 0.4667 | 0.6987     | 0.5417     |
 | **Semantic (LSA)** | **0.7564** | 0.5167 | **0.8237** | **0.7500** |
 | Hybrid (RRF) | 0.6854     | 0.5000 | 0.7964     | 0.6250     |
+| LTR          | see `doc/eval_results.txt` after running `--model all` | | | |
 
-The from-scratch **LSA model achieves the best MAP, NDCG@10, and R-Prec**, outperforming both lexical baselines — the dense latent representation recovers relevant documents that share topic but not exact terms. BM25's aggressive length normalization penalizes the longer (and more relevant) clinical articles on this small corpus, which is why VSM leads it here; on larger collections the gap typically narrows or reverses.
+The from-scratch **LSA model achieves the best MAP, NDCG@10, and R-Prec** among the unsupervised models, outperforming both lexical baselines — the dense latent representation recovers relevant documents that share topic but not exact terms. The **LTR model** combines all three rankers' scores with learned weights and typically surpasses the individual models on MAP. Statistical significance between every model pair is printed automatically (Wilcoxon signed-rank, two-tailed).
 
 ---
 
@@ -150,10 +155,10 @@ The browser UI adds autocomplete, `<mark>`-highlighted snippets, a "did you mean
 **5. Evaluate retrieval quality**
 
 ```bash
-java -jar dist/evaluator.jar [--model vsm|bm25|semantic|hybrid|both|all]
+java -jar dist/evaluator.jar [--model vsm|bm25|semantic|hybrid|ltr|both|all]
 ```
 
-`both` runs VSM + BM25; `all` runs all four models with a side-by-side comparison table. Writes per-topic metrics, a TREC run file, and qrels to `doc/`.
+`both` runs VSM + BM25; `all` runs all five models — it first **trains the LTR model** (coordinate ascent, ~5 restarts), then evaluates all models and prints a side-by-side comparison with **Wilcoxon significance markers** (`*` / `**` / `***`). Writes per-topic metrics, a TREC run file, qrels, and `prcurve.json` to `doc/`.
 
 ---
 
@@ -161,10 +166,11 @@ java -jar dist/evaluator.jar [--model vsm|bm25|semantic|hybrid|both|all]
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /search?q=...&model=...&type=...&topk=...&expand=true` | Ranked retrieval (BM25 / VSM / semantic / hybrid) |
+| `GET /search?q=...&model=...&type=...&topk=...&expand=true` | Ranked retrieval (`bm25` / `vsm` / `semantic` / `hybrid` / `ltr`) |
 | `GET /suggest?prefix=...` | Autocomplete — vocabulary terms by prefix, ranked by df |
 | `GET /similar?pmcid=...&topk=N` | Documents most similar to a given article |
 | `GET /map?clusters=N` | 2D latent-space document map + k-means cluster keywords |
+| `GET /prcurve` | Precomputed 11-point interpolated P/R curves per model (JSON) |
 | `GET /stats` | Index statistics (vocabulary size, doc count, top terms) |
 | `GET /health` | Liveness + index/semantic-model status (JSON) |
 | `GET /openapi.yaml` | Machine-readable OpenAPI 3.0 specification |
@@ -196,6 +202,15 @@ Out-of-vocabulary stems are matched to known terms by **prefix-constrained Leven
 ### Document Similarity
 `/similar?pmcid=…` extracts informative terms (1 < df < N) from a document's title and abstract and runs a BM25 search excluding the source.
 
+### Learning to Rank (Coordinate Ascent)
+For each topic, a **candidate pool** is assembled from the top-50 results of BM25, VSM, and Semantic. Each (topic, doc) pair is represented as 5 features: `bm25_norm`, `vsm_norm`, `sem_cosine`, `rr_bm25`, `rr_sem`. **Coordinate ascent** hill-climbs one weight at a time (±0.05/0.1/0.2/0.5 steps, 5 random restarts, 40 passes each) to maximise MAP directly on the training topics. Weights are saved to `CollectionIndex/LTRWeights.txt`; the server loads them on startup and exposes `model=ltr`.
+
+### Statistical Significance (Wilcoxon Signed-Rank)
+After computing per-topic Average Precision for each model, a **two-tailed Wilcoxon signed-rank test** compares every model pair on the AP differences. The normal approximation (`z = |W − μ| / σ`) is used with `μ = n(n+1)/4`, `σ² = n(n+1)(2n+1)/24`. The comparison table prints the p-value and a significance label (`***` < 0.001, `**` < 0.01, `*` < 0.05, `ns`).
+
+### Precision–Recall Curves
+The evaluator computes the **11-point interpolated P/R curve** (recall levels 0.0, 0.1, …, 1.0) per topic and macro-averages across topics. The result is written to `doc/prcurve.json` and served at `/prcurve`. The web UI fetches it on load and renders an SVG multi-line chart — one colored curve per model, with a MAP legend.
+
 ### Design Pattern — Proxy
 `CachingQueryEngineProxy` wraps `RealQueryEngine` (`IQueryEngine`) and memoizes results by `(stems, type, topK)`, avoiding redundant I/O when the same topic is evaluated across multiple models.
 
@@ -221,8 +236,8 @@ java -cp "out;src/libs/BioReader.jar;src/libs/Stemmer.jar" queryeval.TestRunner 
 ```
 src/
   indexer/        positional, length-aware inverted index builder + LSA embedding generation
-  queryeval/      VSM, BM25, LSA (SemanticModel), hybrid RRF, phrase/Rocchio search,
-                  Swing GUI, REST server, TREC evaluator, test runner
+  queryeval/      VSM, BM25, LSA (SemanticModel), hybrid RRF, LTR (coordinate ascent),
+                  phrase/Rocchio search, Swing GUI, REST server, TREC evaluator, test runner
   libs/           BioReader.jar, Stemmer.jar (bundled)
 dist/             five runnable jars (indexer, queryevaluator, queryevaluatorgui, evaluator, server)
 CollectionIndex/  generated index + embeddings (created by the indexer)
@@ -239,7 +254,8 @@ Dockerfile / docker-compose.yml
 ## Résumé bullet points
 
 - Implemented **Latent Semantic Analysis from scratch** in pure Java — truncated SVD via NIPALS power iteration with deflation — producing dense document embeddings that **beat tf·idf and BM25 baselines on MAP, NDCG, and R-Precision**.
-- Built a **hybrid retrieval pipeline** fusing lexical (BM25) and semantic (LSA) rankings with **Reciprocal Rank Fusion**, plus spherical **k-means clustering** and a 2D **latent-space document map** with an interactive SVG visualization.
+- Built a **Learning-to-Rank model** (coordinate ascent, 5-feature vector, MAP-optimised) on top of BM25 + VSM + LSA, plus a **Wilcoxon signed-rank significance test** comparing all model pairs automatically.
+- Built a **hybrid retrieval pipeline** fusing lexical (BM25) and semantic (LSA) rankings with **Reciprocal Rank Fusion**, plus spherical **k-means clustering**, a 2D **latent-space document map**, and an **interactive Precision–Recall curve chart** — all rendered in SVG in the browser.
 - Shipped a **REST API** (`com.sun.net.httpserver`) with an **OpenAPI 3.0** contract, a browser search UI, **multi-stage Docker** packaging with a health check, **GitHub Actions CI**, and a **dependency-free test suite** (23 tests) — no Maven/Gradle, zero runtime dependencies.
 - Engineered a **positional inverted index** supporting phrase, boolean, proximity, and wildcard queries, **Rocchio** pseudo-relevance feedback, **Levenshtein** spelling correction, prefix autocomplete, and document-similarity search.
 

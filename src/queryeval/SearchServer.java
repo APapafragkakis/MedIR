@@ -29,6 +29,7 @@ public class SearchServer {
         QueryEvaluator.loadVocabulary();
         QueryEvaluator.countDocuments();
         QueryEvaluator.ensureSemantic();
+        QueryEvaluator.ensureLTR();
 
         System.out.println("Index loaded: " + QueryEvaluator.vocabulary.size()
                 + " terms | " + QueryEvaluator.totalDocs + " docs"
@@ -43,6 +44,7 @@ public class SearchServer {
         server.createContext("/map",         SearchServer::handleMap);
         server.createContext("/health",      SearchServer::handleHealth);
         server.createContext("/openapi.yaml", SearchServer::handleOpenApi);
+        server.createContext("/prcurve",     SearchServer::handlePRCurve);
         server.createContext("/",            SearchServer::handleUI);
         server.start();
 
@@ -75,6 +77,20 @@ public class SearchServer {
         if (!f.exists()) { respond(ex, 404, "openapi.yaml not found"); return; }
         byte[] bytes = java.nio.file.Files.readAllBytes(f.toPath());
         ex.getResponseHeaders().add("Content-Type", "application/yaml; charset=UTF-8");
+        ex.sendResponseHeaders(200, bytes.length);
+        try (OutputStream os = ex.getResponseBody()) { os.write(bytes); }
+    }
+
+    // -------------------------------------------------------------------------
+    // /prcurve  -- precomputed 11-point P/R curves from evaluator
+    // -------------------------------------------------------------------------
+
+    static void handlePRCurve(HttpExchange ex) throws IOException {
+        cors(ex);
+        File f = new File(BASE + File.separator + "doc" + File.separator + "prcurve.json");
+        if (!f.exists()) { respond(ex, 404, "{\"error\":\"prcurve.json not found — run evaluator first\"}"); return; }
+        byte[] bytes = java.nio.file.Files.readAllBytes(f.toPath());
+        ex.getResponseHeaders().add("Content-Type", "application/json; charset=UTF-8");
         ex.sendResponseHeaders(200, bytes.length);
         try (OutputStream os = ex.getResponseBody()) { os.write(bytes); }
     }
@@ -458,6 +474,7 @@ public class SearchServer {
             + "</select>"
             + "<select id='model'>"
             + "<option value='hybrid'>Hybrid (BM25+LSA)</option>"
+            + "<option value='ltr'>LTR (learned)</option>"
             + "<option value='bm25'>BM25</option>"
             + "<option value='vsm'>VSM</option>"
             + "<option value='semantic'>Semantic (LSA)</option>"
@@ -504,6 +521,15 @@ public class SearchServer {
             + "<div class='map-legend' id='map-legend'></div>"
             + "</div></div>"
             + "<div class='map-tip' id='maptip'></div>"
+            // P/R curve chart
+            + "<div class='map-wrap'><div class='map-card'>"
+            + "<h3>Precision–Recall Curves</h3>"
+            + "<p class='sub'>11-point interpolated average P/R across all evaluation topics. "
+            + "Requires running the evaluator with <code>--model all</code> first.</p>"
+            + "<svg id='pr-svg' style='width:100%;height:260px;background:#fafbfc;"
+            + "border:1px solid var(--border);border-radius:8px' viewBox='0 0 820 260'></svg>"
+            + "<div class='map-legend' id='pr-legend' style='margin-top:10px'></div>"
+            + "</div></div>"
             // Modal
             + "<div class='modal-backdrop' id='modal' onclick='closeModal(event)'>"
             + "<div class='modal'>"
@@ -733,6 +759,37 @@ public class SearchServer {
             + "}"
             + "function hideTip(){document.getElementById('maptip').style.display='none';}"
             + "loadMap();"
+            + "const PR_COLORS={bm25:'#c5221f',vsm:'#7c3aed',semantic:'#1e8c45',hybrid:'#d97706',ltr:'#1a5fa8'};"
+            + "(async function loadPRCurve(){"
+            + "  try{"
+            + "    const d=await(await fetch('/prcurve')).json();"
+            + "    if(!d.curves)return;"
+            + "    const W=820,H=260,pad=44;"
+            + "    const sx=r=>pad+r*(W-2*pad);"
+            + "    const sy=p=>H-pad-p*(H-2*pad);"
+            + "    let s='';"
+            + "    for(let i=0;i<=4;i++){"
+            + "      s+=`<line x1='${pad}' y1='${sy(i/4).toFixed(0)}' x2='${W-pad}' y2='${sy(i/4).toFixed(0)}' stroke='#e9ecf1'/>`;"
+            + "      s+=`<line x1='${sx(i/4).toFixed(0)}' y1='${pad}' x2='${sx(i/4).toFixed(0)}' y2='${H-pad}' stroke='#e9ecf1'/>`;"
+            + "      s+=`<text x='${sx(i/4).toFixed(0)}' y='${H-pad+14}' font-size='10' text-anchor='middle' fill='#6e7781'>${i*25}%R</text>`;"
+            + "      s+=`<text x='${pad-4}' y='${(sy(i/4)+4).toFixed(0)}' font-size='10' text-anchor='end' fill='#6e7781'>${i*25}%P</text>`;"
+            + "    }"
+            + "    const levels=d.recall_levels||[0,.1,.2,.3,.4,.5,.6,.7,.8,.9,1];"
+            + "    for(const[m,pts] of Object.entries(d.curves)){"
+            + "      const col=PR_COLORS[m]||'#888';"
+            + "      const path=pts.map((p,i)=>`${i===0?'M':'L'}${sx(levels[i]).toFixed(1)},${sy(p).toFixed(1)}`).join(' ');"
+            + "      s+=`<path d='${path}' stroke='${col}' stroke-width='2.2' fill='none' stroke-linejoin='round'/>`;"
+            + "      if(pts.length>0)s+=`<circle cx='${sx(levels[0])}'cy='${sy(pts[0])}'r='3.5'fill='${col}'/>`;"
+            + "    }"
+            + "    document.getElementById('pr-svg').innerHTML=s;"
+            + "    const mapAvg=pts=>pts.reduce((a,b)=>a+b,0)/pts.length;"
+            + "    document.getElementById('pr-legend').innerHTML="
+            + "      Object.entries(d.curves).map(([m,pts])=>"
+            + "        `<div class='leg-item'><span class='leg-swatch' style='background:${PR_COLORS[m]||\"#888\"}'></span>`"
+            + "        +`<b>${m.toUpperCase()}</b><span class='leg-kw'>MAP≈${mapAvg(pts).toFixed(3)}</span></div>`"
+            + "      ).join('');"
+            + "  }catch(e){}"
+            + "})();"
             // Utility
             + "function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}"
             + "</script>"

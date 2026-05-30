@@ -41,6 +41,8 @@ public class QueryEvaluator {
 
     static SemanticModel semantic = null;
     static boolean       semanticTried = false;
+    static double[]      ltrWeights = null;
+    static boolean       ltrTried = false;
 
     static class VocabEntry {
         final String stem;
@@ -374,8 +376,63 @@ public class QueryEvaluator {
     static List<Result> searchByModel(List<String> stems, int topK, String model) throws IOException {
         if ("hybrid".equalsIgnoreCase(model))   return searchHybrid(stems, topK);
         if ("semantic".equalsIgnoreCase(model)) return searchSemantic(stems, topK);
+        if ("ltr".equalsIgnoreCase(model))      return searchLTR(stems, topK);
         if ("bm25".equalsIgnoreCase(model))     return searchBM25(stems, topK);
         return searchVSM(stems, topK);
+    }
+
+    static void ensureLTR() {
+        if (ltrWeights == null && !ltrTried) {
+            ltrTried = true;
+            ltrWeights = LTRModel.load(INDEX_DIR);
+        }
+    }
+
+    static List<Result> searchLTR(List<String> queryStems, int topK) throws IOException {
+        ensureSemantic();
+        ensureLTR();
+        if (ltrWeights == null) return searchBM25(queryStems, topK);
+
+        int pool = Math.max(topK * 3, 50);
+        List<Result> bm = searchBM25(queryStems, pool);
+        List<Result> vs = searchVSM(queryStems, pool);
+        List<Result> sm = semantic != null ? searchSemantic(queryStems, pool) : Collections.emptyList();
+
+        double maxBm = bm.isEmpty() ? 1 : bm.get(0).score;
+        double maxVs = vs.isEmpty() ? 1 : vs.get(0).score;
+
+        Map<String, double[]> featMap = new LinkedHashMap<>();
+        Map<String, String>   pathOf  = new HashMap<>();
+
+        for (int i = 0; i < bm.size(); i++) {
+            Result r = bm.get(i);
+            double[] f = featMap.computeIfAbsent(r.pmcid, k -> new double[LTRModel.NFEAT]);
+            f[0] = maxBm > 0 ? r.score / maxBm : 0;
+            f[3] = 1.0 / (i + 1);
+            pathOf.put(r.pmcid, r.path);
+        }
+        for (int i = 0; i < vs.size(); i++) {
+            Result r = vs.get(i);
+            double[] f = featMap.computeIfAbsent(r.pmcid, k -> new double[LTRModel.NFEAT]);
+            f[1] = maxVs > 0 ? r.score / maxVs : 0;
+            pathOf.put(r.pmcid, r.path);
+        }
+        for (int i = 0; i < sm.size(); i++) {
+            Result r = sm.get(i);
+            double[] f = featMap.computeIfAbsent(r.pmcid, k -> new double[LTRModel.NFEAT]);
+            f[2] = r.score;
+            f[4] = 1.0 / (i + 1);
+            pathOf.put(r.pmcid, r.path);
+        }
+
+        List<Result> out = new ArrayList<>();
+        for (Map.Entry<String, double[]> e : featMap.entrySet()) {
+            String pmcid = e.getKey();
+            double score = LTRModel.score(e.getValue(), ltrWeights);
+            out.add(new Result(pathOf.get(pmcid), pmcid, score));
+        }
+        out.sort(null);
+        return out.subList(0, Math.min(topK, out.size()));
     }
 
     static void ensureSemantic() {
