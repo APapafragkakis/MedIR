@@ -251,14 +251,5 @@ Dockerfile / docker-compose.yml
 
 ---
 
-## Résumé bullet points
-
-- Implemented **Latent Semantic Analysis from scratch** in pure Java — truncated SVD via NIPALS power iteration with deflation — producing dense document embeddings that **beat tf·idf and BM25 baselines on MAP, NDCG, and R-Precision**.
-- Built a **Learning-to-Rank model** (coordinate ascent, 5-feature vector, MAP-optimised) on top of BM25 + VSM + LSA, plus a **Wilcoxon signed-rank significance test** comparing all model pairs automatically.
-- Built a **hybrid retrieval pipeline** fusing lexical (BM25) and semantic (LSA) rankings with **Reciprocal Rank Fusion**, plus spherical **k-means clustering**, a 2D **latent-space document map**, and an **interactive Precision–Recall curve chart** — all rendered in SVG in the browser.
-- Shipped a **REST API** (`com.sun.net.httpserver`) with an **OpenAPI 3.0** contract, a browser search UI, **multi-stage Docker** packaging with a health check, **GitHub Actions CI**, and a **dependency-free test suite** (23 tests) — no Maven/Gradle, zero runtime dependencies.
-- Engineered a **positional inverted index** supporting phrase, boolean, proximity, and wildcard queries, **Rocchio** pseudo-relevance feedback, **Levenshtein** spelling correction, prefix autocomplete, and document-similarity search.
-
----
 
 
